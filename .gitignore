@@ -1,0 +1,87 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# ============================================================
+# ★ 配置与密钥（绝不提交）
+# ============================================================
+config.json
+cloud_config.json
+*.dbcmd.json
+logs/
+v3agent/logs/
+
+# ============================================================
+# ★ 编译 / 打包产物（绝不提交）
+# ============================================================
+build/
+dist/
+发布程序/
+*.exe
+*.msi
+*.zip
+
+# ============================================================
+# 备份与退役文件（形如 xxx.py.bak-20261008 / xxx.retired-20260926）
+# ============================================================
+*.bak
+*.bak-*
+*.retired-*
+*.orig
+
+# ============================================================
+# 日志
+# ============================================================
+*.log
+.workbuddy-*.log
+
+# ============================================================
+# ★ 测试 / 验收 / 探针 / 诊断脚本（不随仓库发布）
+#   scripts/ 只保留构建与运维工具：
+#     build_gui.py / build_installer.py / deploy-gui.py / deploy_cloud*.py /
+#     deploy_python.py / toolchain.py / sshtarget.py / switch-db.py /
+#     start-agent.py / status-agent.py / run-scheduled.py / rthook_reap_mei.py /
+#     pull-*.py / rmf*.py / livecreds.py / backfill-unit-pack.py
+# ============================================================
+scripts/verify-*
+scripts/probe-*
+scripts/probe_server*.py
+scripts/check-*
+scripts/check_remote*.py
+scripts/test-*
+scripts/diag-*
+scripts/accept-*
+scripts/compare-*
+scripts/bisect-*
+scripts/ab-*
+scripts/why-*
+scripts/who-*
+scripts/find-*
+scripts/profile-*
+scripts/finalize-*
+scripts/clean-*
+scripts/cleanup-*
+scripts/kill-*
+scripts/ws_probe_*
+scripts/dump-exe-*
+scripts/run-r9-*
+scripts/stub-*
+scripts/livecreds.local*
+scripts/__pycache__/
+
+# tests/ 整体不发布（本地自测脚本）
+tests/
+
+# ============================================================
+# print_formats：只留格式模板（.bin/.txt/.json），
+# 渲染预览图（.png/.html）与从库拉取的副本（_pulled*）不发布
+# ============================================================
+print_formats/**/*.png
+print_formats/**/*.html
+print_formats/_pulled*/

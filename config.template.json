@@ -1,0 +1,28 @@
+{
+  "_说明": "财鲸V3 本地 Agent 配置模板。复制成 config.json 放在 V3AgentGui.exe 同目录后填写。带 _说明 的键只是注释，Agent 不读。",
+  "sql": {
+    "server": "127.0.0.1",
+    "port": 1433,
+    "user": "sa",
+    "password": "",
+    "database": "",
+    "tds_version": "7.0"
+  },
+  "agent": {
+    "name": "",
+    "secret": "",
+    "relay_url": "ws://149.88.75.125:8000/ws/agent",
+    "reconnect_sec": 5,
+    "heartbeat_sec": 25
+  },
+  "price": {
+    "default_price_column": "D_SJ1",
+    "recent_price_field": "D_PriceTax"
+  },
+  "log_level": "INFO",
+  "_必填": {
+    "agent.name": "商户码，一家一个，由平台方在云端开通时给出；填成别家会顶掉那家的在线连接",
+    "agent.secret": "该商户 Agent 的密钥，只在开通时显示一次；填错会一直 401",
+    "sql.database": "这个商户的账套库名（V3 装在哪套账就读哪套）。填错不会报错，但页面数字会来自另一套账 —— 用 scripts/switch-db.py --list 核对，看 status.json 的 database_verified"
+  }
+}

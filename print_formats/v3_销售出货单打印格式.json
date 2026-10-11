@@ -1,0 +1,391 @@
+{
+  "billNames": [
+    "采购订单",
+    "采购进货单",
+    "采购退货单",
+    "销售订单",
+    "销售出货单",
+    "销售退货单",
+    "库存盘点单",
+    "仓库调拨单",
+    "配货订单",
+    "配货出仓单",
+    "配货退回单",
+    "领料单",
+    "退料单"
+  ],
+  "billName": "销售出货单",
+  "found": true,
+  "paperSize": 26.2,
+  "isPaging": 1,
+  "goodsType": 1,
+  "selectSqlHeader": "select isnull(XT.itemname,case XS.SaleType when 'POSÁãÊÛ' then 'POSÁãÊÛ' else '' end) XsTypeName,XS.*,Khdan.itemmc BName,cktype.text StockName,rydan.rymc EName,UserInfo.username OperName from XS\nleft join Khdan on XS.itembh = Khdan.itembh\nleft join cktype on XS.ckbh = cktype.key_\nleft join rydan on XS.ywbh = rydan.rybh\nleft join UserInfo on XS.zdrbh = UserInfo.userid\nleft join Item_XsType XT on XS.SaleType = XT.Itembh",
+  "selectSqlDetail": "select XSMX.*,hpdan.hpmc,HpdanUnit.Unitrate UnitRate,hpdanunit.UnitBarcode,0.0 as stockNum,hpdan.ggxh,hpdan.UnitPack,HpBrandName,'' fzsl,'' bigsl,'' smallsl from XSMX\nleft join hpdan on XSMX.hpbh = hpdan.hpbh \nleft join hpdanunit on hpdan.IDENGUID= hpdanunit.hpidenguid and hpdanunit.UnitName = XSMX.HpUnitName\nwhere hpdan.hpmc <>'×Ô¶¯Ä¨Áã'",
+  "selectSqlSummary": "",
+  "goodsRow": 5,
+  "headerHeight": 40,
+  "detailHeight": 40,
+  "mappings": [
+    {
+      "id": 102,
+      "scope": "header",
+      "column": "bz_XS",
+      "label": "备注"
+    },
+    {
+      "id": 103,
+      "scope": "header",
+      "column": "j_jewf",
+      "label": "本单金额"
+    },
+    {
+      "id": 104,
+      "scope": "header",
+      "column": "StockName",
+      "label": "仓库名称"
+    },
+    {
+      "id": 105,
+      "scope": "header",
+      "column": "XsTypeName",
+      "label": "出货类型"
+    },
+    {
+      "id": 106,
+      "scope": "header",
+      "column": "Fax",
+      "label": "传真"
+    },
+    {
+      "id": 107,
+      "scope": "header",
+      "column": "AddrBh",
+      "label": "地址简称"
+    },
+    {
+      "id": 108,
+      "scope": "header",
+      "column": "Tel",
+      "label": "电话"
+    },
+    {
+      "id": 109,
+      "scope": "header",
+      "column": "J_JezkSum",
+      "label": "合计金额"
+    },
+    {
+      "id": 110,
+      "scope": "header",
+      "column": "NDate",
+      "label": "开单日期"
+    },
+    {
+      "id": 111,
+      "scope": "header",
+      "column": "BName",
+      "label": "客户"
+    },
+    {
+      "id": 112,
+      "scope": "header",
+      "column": "Lxr",
+      "label": "联系人"
+    },
+    {
+      "id": 113,
+      "scope": "header",
+      "column": "fkday",
+      "label": "收款期限"
+    },
+    {
+      "id": 114,
+      "scope": "header",
+      "column": "sj",
+      "label": "手机"
+    },
+    {
+      "id": 115,
+      "scope": "header",
+      "column": "Address",
+      "label": "送货地址"
+    },
+    {
+      "id": 116,
+      "scope": "header",
+      "column": "BillNo",
+      "label": "系统单号"
+    },
+    {
+      "id": 117,
+      "scope": "header",
+      "column": "EName",
+      "label": "业务员"
+    },
+    {
+      "id": 118,
+      "scope": "header",
+      "column": "J_JEHSSUM",
+      "label": "折后金额"
+    },
+    {
+      "id": 119,
+      "scope": "header",
+      "column": "zdrbh",
+      "label": "制单人"
+    },
+    {
+      "id": 120,
+      "scope": "header",
+      "column": "useno",
+      "label": "自定单号"
+    },
+    {
+      "id": 121,
+      "scope": "detail",
+      "column": "UnitPack",
+      "label": "包装规格"
+    },
+    {
+      "id": 122,
+      "scope": "detail",
+      "column": "d_dj",
+      "label": "单价"
+    },
+    {
+      "id": 123,
+      "scope": "detail",
+      "column": "HpUnitName",
+      "label": "单位"
+    },
+    {
+      "id": 124,
+      "scope": "detail",
+      "column": "HpUnitRate",
+      "label": "单位比率"
+    },
+    {
+      "id": 125,
+      "scope": "detail",
+      "column": "ggxh",
+      "label": "规格型号"
+    },
+    {
+      "id": 126,
+      "scope": "detail",
+      "column": "j_jehs",
+      "label": "含税金额"
+    },
+    {
+      "id": 127,
+      "scope": "detail",
+      "column": "hpmc",
+      "label": "货品名称"
+    },
+    {
+      "id": 128,
+      "scope": "detail",
+      "column": "s_sl",
+      "label": "基本数量"
+    },
+    {
+      "id": 129,
+      "scope": "detail",
+      "column": "j_je",
+      "label": "金额"
+    },
+    {
+      "id": 130,
+      "scope": "detail",
+      "column": "bz_xsmx",
+      "label": "明细备注"
+    },
+    {
+      "id": 131,
+      "scope": "detail",
+      "column": "HpBrandName",
+      "label": "品牌"
+    },
+    {
+      "id": 132,
+      "scope": "detail",
+      "column": "hpbh",
+      "label": "商品编号"
+    },
+    {
+      "id": 133,
+      "scope": "detail",
+      "column": "s_slUnit",
+      "label": "数量"
+    },
+    {
+      "id": 134,
+      "scope": "detail",
+      "column": "unitbarcode",
+      "label": "条码"
+    },
+    {
+      "id": 135,
+      "scope": "detail",
+      "column": "d_djzk",
+      "label": "折后单价"
+    },
+    {
+      "id": 136,
+      "scope": "detail",
+      "column": "J_jezk",
+      "label": "折后金额"
+    },
+    {
+      "id": 137,
+      "scope": "detail",
+      "column": "zk",
+      "label": "折扣"
+    }
+  ],
+  "layout": [
+    {
+      "id": 53,
+      "x": 5,
+      "y": 50,
+      "w": 400,
+      "text": "单号:",
+      "text2": "",
+      "size": 9,
+      "area": "表头1",
+      "barcode": null
+    },
+    {
+      "id": 54,
+      "x": 405,
+      "y": 50,
+      "w": 360,
+      "text": "开单日期:",
+      "text2": "",
+      "size": 9,
+      "area": "表头1",
+      "barcode": null
+    },
+    {
+      "id": 55,
+      "x": 5,
+      "y": 90,
+      "w": 760,
+      "text": "往来单位:",
+      "text2": "",
+      "size": 9,
+      "area": "表头1",
+      "barcode": null
+    },
+    {
+      "id": 56,
+      "x": 5,
+      "y": 130,
+      "w": 760,
+      "text": "备注:",
+      "text2": "",
+      "size": 9,
+      "area": "表头1",
+      "barcode": null
+    },
+    {
+      "id": 57,
+      "x": 5,
+      "y": 170,
+      "w": 80,
+      "text": "商品编号",
+      "text2": "",
+      "size": 9,
+      "area": "明细",
+      "barcode": null
+    },
+    {
+      "id": 58,
+      "x": 85,
+      "y": 170,
+      "w": 200,
+      "text": "商品名称",
+      "text2": "",
+      "size": 9,
+      "area": "明细",
+      "barcode": null
+    },
+    {
+      "id": 59,
+      "x": 285,
+      "y": 170,
+      "w": 160,
+      "text": "规格",
+      "text2": "",
+      "size": 9,
+      "area": "明细",
+      "barcode": null
+    },
+    {
+      "id": 60,
+      "x": 445,
+      "y": 170,
+      "w": 80,
+      "text": "数量",
+      "text2": "",
+      "size": 9,
+      "area": "明细",
+      "barcode": null
+    },
+    {
+      "id": 61,
+      "x": 525,
+      "y": 170,
+      "w": 120,
+      "text": "单价",
+      "text2": "",
+      "size": 9,
+      "area": "明细",
+      "barcode": null
+    },
+    {
+      "id": 62,
+      "x": 645,
+      "y": 170,
+      "w": 120,
+      "text": "金额",
+      "text2": "",
+      "size": 9,
+      "area": "明细",
+      "barcode": null
+    },
+    {
+      "id": 63,
+      "x": 5,
+      "y": 210,
+      "w": 200,
+      "text": "制单人",
+      "text2": "",
+      "size": 9,
+      "area": "表头1",
+      "barcode": null
+    },
+    {
+      "id": 64,
+      "x": 325,
+      "y": 10,
+      "w": 200,
+      "text": "销售出货单",
+      "text2": "",
+      "size": 19,
+      "area": "表头2",
+      "barcode": null
+    },
+    {
+      "id": 65,
+      "x": 645,
+      "y": 10,
+      "w": 120,
+      "text": "{页码}",
+      "text2": "",
+      "size": 9,
+      "area": "表头2",
+      "barcode": null
+    }
+  ]
+}
