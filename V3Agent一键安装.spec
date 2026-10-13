@@ -23,6 +23,7 @@ exe = EXE(
     a.datas,
     [],
     name='V3Agent一键安装',
+    icon='D:/重构/进销存-本地Agent源码/assets/icons/v3agent.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

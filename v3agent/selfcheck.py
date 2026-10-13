@@ -232,7 +232,11 @@ def _cloud(cfg):
     try:
         s = socket.create_connection((host, port), timeout=5)
         s.close()
-        return _item("cloud", "云端中转可达（%s:%d）" % (host, port), True, "TCP 通",
+        # ★ 明文链留痕（不判失败，理由见 v3agent/config.relay_scheme_note）：
+        #   技术员把这份 txt 发回来时，平台方要能一眼看见"这台机器在走明文"。
+        note = cfgmod.relay_scheme_note(cfg)
+        detail = "TCP 通" + (("；⚠ " + note) if note else "")
+        return _item("cloud", "云端中转可达（%s:%d）" % (host, port), True, detail,
                      "TCP 通但 status.json 里 connected=false ⇒ 多半是商户码/密钥不对，"
                      "或被云端按同指纹拒连（4002）")
     except Exception as exc:  # noqa: BLE001

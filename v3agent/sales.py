@@ -423,6 +423,28 @@ def list_bills(cur, date_from=None, date_to=None, customer=None, keyword=None,
        目标库是 **SQL Server 2008 R2**，不支持 OFFSET/FETCH。
        单用 Idencol 排序在补录单场景会跟用户看到的日期顺序不一致。
 
+    ★★★ 【不要尝试的两段式优化】（2026-10-12 实测否决，教训要留着）
+       压测发现本查询 p50 ≈ 62ms，而 `ORDER BY NDate DESC` 单键只要 0.6ms
+       —— 差 100 倍，因为 XS 聚集索引 `IX_XS_NDate` **只含 NDate**，
+       加上第二键 Idencol 就无法用索引排序，退化成 36615 行全表排序。
+       看起来"先用单键索引定位日期边界、再在窄集合内双键排序"能白拿 50 倍，
+       实测也确实快（0.6~1.8ms）。**但它是错的**，已否决，原因是：
+
+         · 单键序（NDate DESC）与双键序（NDate DESC, Idencol DESC）
+           在**跨天的补录单**上结果不同。本库实证：
+             Idencol=36667 → NDate=2026-09-21（补录）
+             Idencol=36668 → NDate=2026-09-19（补录）
+           双键序把 36668 排在 36667 之前（Idencol 更大），
+           单键序把 09-21 排在 09-19 之前（日期更新）——**顺序相反**。
+         · 所以"第一段用单键定位的边界"与"第二段双键编号"对不上，
+           实测 offset=0/20/100/500 四档全部与旧实现**不一致**（整页错位）。
+         · 陷阱在于：`TOP 1000` 这种截断对比会显示"完全一致"，
+           因为差异只出现在被截断的位置附近 —— 必须比对**整页**才不会误判。
+         · 真要提速只能给 XS 加 `(NDate DESC, Idencol DESC)` 索引，
+           但 XS 是 V3 出厂表、聚集索引由桌面端共用，**不能动结构**。
+       ⇒ 结论：接受这 62ms。列表页有分页（limit 默认 100），
+         且连接复用已经把建连开销消掉，这条是当前可优化的极限。
+
     ★ 关键字要能搜到「客户名称」，而客户名在 Khdan 里，
       所以子查询必须带这个 JOIN，外层再取一次是为了拿 Itemmc。
     """
@@ -996,14 +1018,21 @@ def _create_bill_inner(cur, cfg, customer, lines, ndate, warehouse, note,
     _lock_res = db.app_lock_resource(idem.db_of(cfg), "xs", 2020)
     _lock_held = False
     try:
-        _, nid = db.next_bill_number(
+        _prefix, nid = db.next_bill_number(
             cur, bill_na_id=2020, database=idem.db_of(cfg), kind="xs",
+            # ★ 前缀现读 V3 的配置行（与采购同一套，2026-10-12）：
+            #   原先这里写死 "XK"，而单号前缀在 V3 是 `No_BillID.BILLNOLEFT2` 一列，
+            #   客户在桌面端改了、这边还在发 XK ⇒ 两边出的号不一样。
+            #   实测现网这本账 2020 那行就是 'XK'（XS 138 张全是 XK 前缀），
+            #   所以这一改**不改变现在的号**，只是让它跟着真源走。
+            prefix_sql="SELECT ISNULL(BILLNOLEFT2,'') FROM No_BillID WHERE BillNaID=2020",
             max_sql="SELECT ISNULL(MAX(IdenCol),0) FROM XS",
         )
         _lock_held = True
+        prefix = (_prefix or "XK").strip() or "XK"
     except Exception:
         raise
-    bill_no = "XK" + str(nid).zfill(8)
+    bill_no = prefix + str(nid).zfill(8)
     # ★★★ Useno 必须留空 —— **不要再生成 "XS"+序号**（2026-09-22 用户明确要求）
     #
     # 业务事实：V3 里 `BillNo` 与 `Useno` 是**两套完全独立的计数器**：

@@ -30,6 +30,20 @@ def norm_text(s) -> str:
     return s
 
 
+def search_norm(s) -> str:
+    """搜索用的再归一化：在 `norm_text` 之上把标点/符号全去掉，只留汉字与字母数字。
+
+    ★ 为什么要这一层：V3 的拼音码（`Hpdan.Py`）长这样 —— `LS（BT）`、`BXGNLJ2.5*20`。
+      `norm_text` 只统一全半角与乘号，括号还在 ⇒ 人打「lsbt」搜"螺丝（杯头）"就匹配不上，
+      而他恰恰是按拼音码打的。编号里的点、规格里的斜杠同理。
+    ★ 只用于搜索串与关键词，**不参与相似度打分**（打分要保留规格差异，去掉符号会把
+      M6/20 与 M6-20 判成同一个东西，那是另一类错）。
+    ★ 一律转小写：V3 存的拼音码是大写（`LS（BT）`），而人在手机键盘上打的是小写 `lsbt`
+      —— 不统一大小写就等于"拼音码搜索只对一半"。
+    """
+    return re.sub(r"[^0-9a-z一-鿿]", "", norm_text(s).lower())
+
+
 @dataclass
 class PartRow:
     """客户表格里的一行零件。"""
@@ -350,6 +364,18 @@ class Matcher:
         self.sys_map = sys_map or {}
         self.source_label = f"SQL Server HPKhType {len(rows)} 条"
 
+    def forget(self, reason: str = "未加载"):
+        """把物料库整份丢掉（★ 换账套必须调它）。
+
+        ★ 为什么不能留着：`items` 是从**某一本书**里抓出来的 HPKhType。
+          切到账套 B 之后还拿着 A 的库给候选，人看到的是"A 账的编号 + B 账的单子"，
+          点下去写进去的是一个在 B 账里不存在、或根本是另一种东西的编号 ——
+          界面上一切都"正常"，只有对账时才看得出来。
+        """
+        self.items = []
+        self.sys_map = {}
+        self.source_label = reason
+
     def fill_sys(self, row: PartRow):
         """按 hpbh 从物料库/hpdan 补系统产品名、规格。"""
         item = next((it for it in self.items if it.get("code") == row.erp_code), None)
@@ -421,51 +447,91 @@ class Matcher:
         row.status = "未匹配"
         row.source = ""
 
-    def suggest(self, row: PartRow, keyword: str = "", top: int | None = None) -> list[tuple[float, dict]]:
-        """模糊搜索物料库，返回 (相似度, 物料) 候选。
+    def _sys_name(self, it: dict) -> str:
+        """物料对应的系统品名（hpdan 里查到的）。搜索时要连它一起命中。"""
+        info = (getattr(self, "sys_map", None) or {}).get(it.get("code") or "") or {}
+        return info.get("sys_name") or it.get("sys_name") or ""
 
-        默认返回全部达标（相似度≥0.35）的候选并按分数从高到低排序；
-        传入 top 时只取前 top 条。
+    def _blob(self, it: dict) -> str:
+        """一行物料"能被搜到的字"：客户品名 + 两个规格 + 编号 + 系统品名 + **拼音码**。
+
+        ★ 系统品名一起进来（2026-10-13）：桌面弹窗的筛选框本来就带它，
+          而 op 侧原来不带 ⇒ 同一段字，手机上搜不到、电脑上搜得到。
+        ★ 拼音码（`Hpdan.Py`，2026-10-13 加）：V3 自己就靠这一列搜货品，
+          老板在桌面端打的是 `lsbt`、`bxgnlj`，到手机上打同样的字必须搜得到。
+          库里 4.8 万条有 99.99% 填了它，不是冷门字段。
+        ★ 整串走 `search_norm`：拼音码长这样 `LS（BT）`，不剥括号打 `lsbt` 就对不上。
         """
+        return search_norm(
+            (it.get("name_n") or "") + (it.get("spec_a_n") or "")
+            + (it.get("spec_b_n") or "") + (it.get("code") or "")
+            + self._sys_name(it) + self._sys_py(it))
+
+    def _sys_py(self, it: dict) -> str:
+        """这条物料对应系统档案的拼音码（V3 `Hpdan.Py`）。没有就是空串。"""
+        info = (getattr(self, "sys_map", None) or {}).get(it.get("code") or "") or {}
+        return info.get("sys_py") or it.get("sys_py") or ""
+
+    def _sim(self, row: PartRow, it: dict) -> float:
+        """这一行与这条物料的相似度（0~1）。"""
         a_n = row.merge_a_n
         b_n = row.merge_b_n
         name_n = norm_text(row.name)
         spec_n = norm_text(row.spec)
         actual_n = norm_text(row.actual)
-        kw = norm_text(keyword)
+        # ★ 2026-10-09 修：不再让"空对空"参与打分。
+        #   客户行没有实际尺寸时 b_n 只剩名称；物料 HpbhKh 为空时 key_b 也只剩名称
+        #   ⇒ (b_n, key_b) 这一对必然满分，把同名不同规格的候选全顶到 100%
+        #   （现场看到"杯头螺丝 M6*35 的两条候选都是 100%"，就是它）。
+        #   同理，两侧都没有规格信息时 (a_n, key_a) 也只是"名称比名称"——
+        #   那件事已经由下面的 nsim 负责，不该再算一次。
+        it_spec_a = it.get("spec_a_n") or ""
+        it_spec_b = it.get("spec_b_n") or ""
+        pairs = []
+        if a_n and it.get("key_a") and (spec_n or it_spec_a):
+            pairs.append((a_n, it.get("key_a")))
+        if b_n and it.get("key_b") and actual_n and it_spec_b:
+            pairs.append((b_n, it.get("key_b")))
+        if b_n and it.get("key_a") and actual_n and it_spec_a:
+            pairs.append((b_n, it.get("key_a")))
+        if a_n and it.get("key_b") and spec_n and it_spec_b:
+            pairs.append((a_n, it.get("key_b")))
+        msim = 0.0
+        tok = 0.0
+        for x, y in pairs:
+            if x and y:
+                msim = max(msim, SequenceMatcher(None, x, y).ratio())
+                tok = max(tok, _token_overlap(x, y))
+        nsim = SequenceMatcher(None, name_n, it.get("name_n") or "").ratio()
+        return msim * 0.6 + tok * 0.2 + nsim * 0.2
+
+    def suggest(self, row: PartRow, keyword: str = "", top: int | None = None,
+                search: bool = False) -> list[tuple[float, dict]]:
+        """模糊搜索物料库，返回 (相似度, 物料) 候选。
+
+        默认（`search=False`）返回全部达标（相似度≥0.35）的候选并按分数从高到低排序；
+        传入 top 时只取前 top 条。
+
+        ★ `search=True` 是**在整库里搜**（App 候选框顶部那栏搜索用）：
+          只要关键词命中就返回，**不套 0.35 那道门槛**。
+          原来 keyword 是在"已经达标的候选"里再筛一遍 ⇒ 拿编号或系统品名去搜一个
+          规格完全不同的东西，会因为"不相似"被丢掉，搜索框形同虚设。
+          相似度仍然带回去，只用来排序和显示，不再当筛子。
+        """
+        # ★ 关键词与搜索串必须过**同一个**归一化：只剥一边的话括号/点会永远对不上
+        kw = search_norm(keyword)
         scored: list[tuple[float, dict]] = []
         for it in self.items:
-            blob = (it.get("name_n") or "") + (it.get("spec_a_n") or "") + (it.get("spec_b_n") or "") + (it.get("code") or "")
-            if kw and kw not in blob:
+            if kw and kw not in self._blob(it):
                 continue
-            # ★ 2026-10-09 修：不再让"空对空"参与打分。
-            #   客户行没有实际尺寸时 b_n 只剩名称；物料 HpbhKh 为空时 key_b 也只剩名称
-            #   ⇒ (b_n, key_b) 这一对必然满分，把同名不同规格的候选全顶到 100%
-            #   （现场看到"杯头螺丝 M6*35 的两条候选都是 100%"，就是它）。
-            #   同理，两侧都没有规格信息时 (a_n, key_a) 也只是"名称比名称"——
-            #   那件事已经由下面的 nsim 负责，不该再算一次。
-            it_spec_a = it.get("spec_a_n") or ""
-            it_spec_b = it.get("spec_b_n") or ""
-            pairs = []
-            if a_n and it.get("key_a") and (spec_n or it_spec_a):
-                pairs.append((a_n, it.get("key_a")))
-            if b_n and it.get("key_b") and actual_n and it_spec_b:
-                pairs.append((b_n, it.get("key_b")))
-            if b_n and it.get("key_a") and actual_n and it_spec_a:
-                pairs.append((b_n, it.get("key_a")))
-            if a_n and it.get("key_b") and spec_n and it_spec_b:
-                pairs.append((a_n, it.get("key_b")))
-            msim = 0.0
-            tok = 0.0
-            for x, y in pairs:
-                if x and y:
-                    msim = max(msim, SequenceMatcher(None, x, y).ratio())
-                    tok = max(tok, _token_overlap(x, y))
-            nsim = SequenceMatcher(None, name_n, it.get("name_n") or "").ratio()
-            score = msim * 0.6 + tok * 0.2 + nsim * 0.2
-            if score < 0.35:
+            score = self._sim(row, it)
+            if not search and score < 0.35:
                 continue
             scored.append((score, it))
+        if search:
+            # 同分时按编号排，保证同一个关键词每次刷出来的顺序一样（列表会跳很碍点选）
+            scored.sort(key=lambda t: (-t[0], str(t[1].get("code") or "")))
+            return scored[: (top or 50)]
         scored.sort(key=lambda t: t[0], reverse=True)
         if top:
             return scored[:top]

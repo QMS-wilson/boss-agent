@@ -256,11 +256,19 @@ def match(cur, cfg, params) -> dict:
 
 
 def suggest(cur, cfg, params) -> dict:
-    """未匹配行的候选（与桌面双击弹窗同一函数、同一排序）。"""
+    """未匹配行的候选（与桌面双击弹窗同一函数、同一排序）。
+
+    ★ `search=1`：在整库里按关键词搜（App 候选框顶部那栏），不套相似度门槛。
+      一次最多回 50 条 —— 手机上一次渲染几百条会明显卡，而且那也看不清。
+    """
     items, sys_map, _missing = _load_library(cur, cfg)
     if not items:
         raise YxError("YX_ACCOUNT_SET_EMPTY", "本账套的客户品名库是空的，请先导入燕秀品名",
                       {"database": (cfg.get("sql") or {}).get("database") or ""})
+    searching = bool(params.get("search"))
+    keyword = str(params.get("keyword") or "")
+    if searching and not keyword.strip():
+        raise YxError("YX_SEARCH_NO_KEYWORD", "要按关键词搜货品，先输入两个字再搜")
     row = yxcore.PartRow(source_file="", sheet="", mold_no="", seq="", part_no_orig="",
                          name=str(params.get("name") or ""), material="",
                          qty=0, spec=str(params.get("spec") or ""),
@@ -269,7 +277,8 @@ def suggest(cur, cfg, params) -> dict:
     try:
         matcher = yxcore.Matcher(store)
         matcher.load_hpdan(items, sys_map)
-        cands = matcher.suggest(row, keyword=str(params.get("keyword") or ""))
+        cands = matcher.suggest(row, keyword=keyword, search=searching,
+                                top=int(params.get("top") or 50) if searching else None)
     finally:
         store.close()
     out = []
@@ -278,8 +287,13 @@ def suggest(cur, cfg, params) -> dict:
         out.append({"hpbh": it.get("code") or "", "hpmcKh": it.get("name") or "",
                     "hpmc": info.get("sys_name") or it.get("sys_name") or "",
                     "specA": it.get("spec_a") or "", "specB": it.get("spec_b") or "",
-                    "unit": it.get("unit") or "", "score": round(float(score), 4)})
-    return {"items": out}
+                    "unit": it.get("unit") or "", "score": round(float(score), 4),
+                    # 拼音码带回去：手机上搜的就是它，列表里得让人看见自己搜的东西
+                    "py": (sys_map.get(it.get("code") or "") or {}).get("sys_py") or ""})
+    # search / total 回给前端：列表标题要写清"这是按关键词在整库里搜的"还是"按相似度给的候选"，
+    # 否则同一个框换个关键词，人不知道看到的列表是怎么来的。
+    return {"items": out, "search": bool(searching), "keyword": keyword,
+            "total": len(out), "capped": bool(searching and len(out) >= 50)}
 
 
 def remember(cur, cfg, params) -> dict:

@@ -104,6 +104,31 @@ def first_run_config(template=None):
     return cfg
 
 
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def relay_scheme_note(cfg):
+    """明文云端地址的提醒（**不挡上线**；空串 = 没问题）。
+
+    ★ 为什么不进 `validate_identity()`：现网这条链是 `ws://<公网 IP>:8000`，
+      把它做成"不许上线"= 换包当天客户整片离线。换 wss 要 nginx 的 `/ws/` 反代
+      与证书先到位（那是装机窗口的动作，不由 Agent 自己决定），
+      所以这里只做**看得见**的告警：daemon 启动日志与现场自检各打一条。
+    ★ 为什么值得警告：这条链上走的是 agent.secret、V3 操作员口令、全部业务数据，
+      明文出公网等于谁在路径上都能看。
+    ★ loopback 放行：本地起云端自测是常规姿势，那种流量不出这台机器。
+    """
+    relay = str(((cfg or {}).get("agent") or {}).get("relay_url") or "").strip()
+    if not relay.lower().startswith("ws://"):
+        return ""
+    host = relay[len("ws://"):].split("/", 1)[0].rsplit("@", 1)[-1]
+    host = (host.split("]", 1)[0] + "]") if host.startswith("[") else host.split(":", 1)[0]
+    if host.lower() in LOOPBACK_HOSTS:
+        return ""
+    return ("云端地址是明文 ws://（%s）：这条链要送 Agent 密钥、操作员口令和全部业务数据，"
+            "公网请用 wss://<域名>/ws/agent（nginx 的 /ws/ 反代已在部署模板里）" % relay)
+
+
 def validate_identity(cfg):
     """返回"这条配置不许上线"的人话清单（空列表 = 可以上线）。
 

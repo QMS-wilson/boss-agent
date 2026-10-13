@@ -1142,6 +1142,11 @@ def run_daemon(config_path=None, runtime_dir_override=None):
     sw.add_log("后台 Agent 启动 pid=%d" % os.getpid())
     sw.add_log("配置：%s" % path)
     sw.add_log("云端：%s" % sw.relay_url)
+    # ★ 明文 ws:// 出公网要留痕（不挡上线，理由见 v3agent/config.relay_scheme_note）：
+    #   现场出问题时，日志里得能看见"这条链当初是明文"这件事。
+    _relay_note = cfgmod.relay_scheme_note(cfg)
+    if _relay_note:
+        sw.add_log("⚠ " + _relay_note, "warn")
     sw.add_log("可执行操作：%d 个" % len(ops.OPS))
     sw.database = cfgmod.get_database(cfg)
     sw.add_log("账套（配置）：%s" % sw.database)
@@ -1250,6 +1255,9 @@ def run_daemon(config_path=None, runtime_dir_override=None):
     HEAVY_OPS = {
         "report.product.ranking",
         "report.customer.ranking",
+        # ★ 与云端 cloudapi/config.REPORT_OPS 同源（check-capacity 逐条比对）：
+        #   供应商排行是同构的聚合宽表，2026-10-12 补上，别再走 8 线程的快池。
+        "report.supplier.ranking",
         "report.profit.summary",
         "report.customer.product.detail",
         "report.customer.statement",

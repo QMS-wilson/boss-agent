@@ -104,9 +104,14 @@ def fetch_hpdan_sys_map(full_cfg: dict) -> tuple[dict[str, dict], list[str]]:
         if missing:
             return {}, missing
         actual = {k: cols[k.lower()] for k in (f_name, f_code, f_spec)}
+        # 拼音码是**可选列**：有就一起取（搜 `lsbt` 靠它），某个客户的库没这列也不许把
+        # 整份映射废掉 —— 那会让系统品名一起消失，比少一个搜索入口严重得多。
+        f_py = hp.get("py_field", "Py")
+        py_col = cols.get(f_py.lower())
         sql = (
-            f"SELECT [{actual[f_code]}] AS c, [{actual[f_name]}] AS n, [{actual[f_spec]}] AS s "
-            f"FROM [{table.strip('[]').split('.')[-1]}]"
+            f"SELECT [{actual[f_code]}] AS c, [{actual[f_name]}] AS n, [{actual[f_spec]}] AS s"
+            + (f", [{py_col}] AS p" if py_col else ",'' AS p")
+            + f" FROM [{table.strip('[]').split('.')[-1]}]"
         )
         cur = conn.cursor(as_dict=True)
         cur.execute(sql)
@@ -118,6 +123,7 @@ def fetch_hpdan_sys_map(full_cfg: dict) -> tuple[dict[str, dict], list[str]]:
             mapping[code] = {
                 "sys_name": (r.get("n") or "").strip(),
                 "sys_spec": (r.get("s") or "").strip(),
+                "sys_py": (r.get("p") or "").strip(),
             }
         return mapping, []
     finally:
@@ -286,13 +292,17 @@ def fetch_hpdan_sys_map_cur(cur, full_cfg: dict) -> tuple[dict[str, dict], list[
     missing = [f for f in (f_name, f_code, f_spec) if f.lower() not in have]
     if missing:
         return {}, missing
-    cur.execute(f"SELECT [{have[f_code.lower()]}], [{have[f_name.lower()]}], [{have[f_spec.lower()]}] FROM [{table}]")
+    py_col = have.get(str(hp.get("py_field", "Py")).lower())
+    cur.execute(f"SELECT [{have[f_code.lower()]}], [{have[f_name.lower()]}], [{have[f_spec.lower()]}],"
+                + (f" [{py_col}]" if py_col else " ''")
+                + f" FROM [{table}]")
     mapping: dict[str, dict] = {}
-    for code, name, spec in cur.fetchall():
+    for code, name, spec, py in cur.fetchall():
         code = (code or "").strip()
         if not code:
             continue
-        mapping[code] = {"sys_name": (name or "").strip(), "sys_spec": (spec or "").strip()}
+        mapping[code] = {"sys_name": (name or "").strip(), "sys_spec": (spec or "").strip(),
+                         "sys_py": (py or "").strip()}
     return mapping, []
 
 

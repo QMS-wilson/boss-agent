@@ -5,7 +5,7 @@ a = Analysis(
     ['D:/重构/进销存-本地Agent源码/agent_gui.py'],
     pathex=['D:/重构/进销存-本地Agent源码'],
     binaries=[],
-    datas=[('D:/重构/进销存-本地Agent源码/config.template.json', '.'), ('D:/重构/进销存-本地Agent源码/build/_pkginfo/VERSION.json', '.')],
+    datas=[('D:/重构/进销存-本地Agent源码/assets/icons/v3agent.ico', 'assets/icons'), ('D:/重构/进销存-本地Agent源码/config.template.json', '.'), ('D:/重构/进销存-本地Agent源码/build/_pkginfo/VERSION.json', '.')],
     hiddenimports=['v3agent', 'v3agent.main', 'v3agent.agent', 'v3agent.ops', 'v3agent.config', 'v3agent.sql', 'agent_daemon', 'agent_gui', 'websockets', 'websockets.asyncio', 'websockets.asyncio.client', 'websockets.legacy', 'websockets.legacy.client', 'pymssql', '_mssql', 'tkinter', 'tkinter.scrolledtext', 'tkinter.messagebox', 'tkinter.ttk'],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['D:/重构/进销存-本地Agent源码/assets/icons/v3agent.ico'],
 )

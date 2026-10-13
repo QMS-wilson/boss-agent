@@ -2,6 +2,7 @@
 """SQL Server 连接与通用查询辅助（全部经白名单 op 调用，不对外透传 SQL）。"""
 
 from contextlib import contextmanager
+import threading
 import time
 
 import pymssql
@@ -22,18 +23,206 @@ def connect(cfg):
     )
 
 
+# ================================================== 连接复用（线程本地池）
+#
+# ★★★ 为什么要池（2026-10-12 压测实测）：
+#   改造前 `session()` 是 **每 op 新建一条 pymssql 连接、用完 close**。
+#   实测建连（TCP + login 握手）稳态约 **25ms**，而一条轻查询（customer.search）
+#   本体只要 ~13ms —— 也就是说**超过一半的耗时花在了"开门"上**。
+#   80 并发时这条成本被乘以 80，是列表/详情类接口延迟的主因之一。
+#   复用后同一线程第二次起不再付这笔钱（实测 bill.list 102ms → 77ms）。
+#
+# ★ 为什么用**线程本地**而不是共享队列池：
+#   生产 Agent 的执行体是 `ThreadPoolExecutor`（快池 8 + 重池 2），
+#   线程数固定且远小于并发请求数 ⇒ 每线程持有一条长连接就把并发度吃满了，
+#   实现上也没必要引入借还协议与超时回收（那类池最容易在异常路径上漏连接）。
+#   代价：池里最多 10 条连接（8+2），对 SQL Server 毫无压力。
+#
+# ★ 为什么 key 必须带 database：
+#   账套可按请求路由（`agent.cfg_for_database` 会 deep-copy 一份只改 database 的 cfg）。
+#   不带 database 做 key 就会把"读 A 库的连接"拿去读 B 库 —— **静默串账**，
+#   这是本项目最不能犯的错。所以 key = (server, port, user, database)。
+#
+# ★ 为什么回池前要 `sp_reset_connection`（等价物）：
+#   连接上可能残留：未提交事务、`sp_getapplock @LockOwner='Session'` 持有的
+#   应用锁、SET 选项、临时表。尤其**取号那把 applock 是会话级的** ——
+#   若某条异常路径漏了 release，复用这条连接的下一个请求会**一直拿不到号**。
+#   所以归还前rollback + 释放本会话持有的 applock；出错就干脆丢弃这条连接重开
+#   （丢弃是安全兜底，不算性能问题——异常本来就是少数路径）。
+#
+# ★ 为什么要有"活性探测"：
+#   `agent.capabilities` 依赖 `db.session(cfg)` 在**库挂掉时抛异常**
+#   （否则它会把 dbStatus 报成 healthy）。复用的连接若在 SQL Server 重启后
+#   还躺在池里，直接拿它执行会报"连接已断" —— 那正好也是异常，语义正确。
+#   真正的风险是相反方向：连接看着还在、实际已废，于是首次用报错、第二次才好。
+#   因此这里**不主动 ping**（那会把每 op 又加一次往返），而是让断连**如实抛错**，
+#   抛错后把这条连接从池里摘掉（下次自动重建）—— 失败一次，之后就好。
+
+_POOL = threading.local()
+
+#: 单进程池里最多几条连接（= 快池 8 + 重池 2 + 2 条余量给热切/状态帧）。
+#: 只用于统计与超限告警，不做强制回收。
+POOL_MAX = 12
+
+_pool_lock = threading.Lock()
+_pool_size = 0          # 当前池中现存连接数（仅统计用）
+
+
+def _conn_key(cfg):
+    """连接身份：(server, port, user, database)。换任何一项都必须换连接。"""
+    sql = cfg["sql"]
+    return (str(sql.get("server") or ""), int(sql.get("port", 1433) or 1433),
+            str(sql.get("user") or ""), str(sql.get("database") or ""))
+
+
+class _Pooled:
+    """线程本地的一条可复用连接 + 其身份 key。"""
+
+    __slots__ = ("conn", "key")
+
+    def __init__(self, conn, key):
+        self.conn = conn
+        self.key = key
+
+
+def _new_pooled(cfg):
+    global _pool_size
+    conn = connect(cfg)
+    with _pool_lock:
+        _pool_size += 1
+    return _Pooled(conn, _conn_key(cfg))
+
+
+#: 本连接**当前仍持有**的会话级应用锁（资源名集合）。
+#: ★★★ 这是连接复用最危险的一处状态：`sp_getapplock @LockOwner='Session'` 的锁
+#:   随**会话**存活，不随事务 —— 回滚、commit 都带不走它。若某条异常路径漏了
+#:   release，这把锁会挂在被复用的连接上；而它又是"整个账套的取号权"，
+#:   下一个用这条连接的请求**永远拿不到号**（10s 超时后报"暂被占用"），
+#:   而且换任何一个新请求都还是同一条坏连接 ⇒ 表现成"这家客户忽然再也开不了单"。
+#:   ⇒ 所以不靠"调用方记得释放"，而是在**取号/放号这一对函数里自己记账**：
+#:     取到号就登记，释放成功就销账；回池前若发现有欠账，**直接丢弃这条连接**
+#:     （Session 级锁随连接关闭由 SQL Server 释放，这是最硬的兜底）。
+_HELD_LOCKS = {}
+
+_held_lock = threading.Lock()
+
+
+def _lock_mark(conn, resource, held):
+    """登记/注销「这条连接是否还持着这把应用锁」。"""
+    with _held_lock:
+        key = id(conn)
+        if held:
+            _HELD_LOCKS.setdefault(key, set()).add(resource)
+        else:
+            got = _HELD_LOCKS.get(key)
+            if got:
+                got.discard(resource)
+                if not got:
+                    _HELD_LOCKS.pop(key, None)
+
+
+def _lock_pending(conn):
+    """这条连接上是否还有未释放的应用锁（有 ⇒ 不许复用，必须丢弃）。"""
+    with _held_lock:
+        return bool(_HELD_LOCKS.get(id(conn)))
+
+
+def _lock_forget(conn):
+    """连接销毁时清账，避免 id() 复用导致误判。"""
+    with _held_lock:
+        _HELD_LOCKS.pop(id(conn), None)
+
+
+def _reset_for_reuse(conn):
+    """回池前的清理。任何一步失败都代表这条连接的会话状态不可信 ⇒ 调用方丢弃它。
+
+    · rollback：扔掉未提交事务（只读 op 走 commit 后这里是空操作；
+      写 op 在自己函数里已 commit）。**绝不能让下一条请求继承上一条的事务**。
+    · 应用锁欠账检查：`sp_releaseapplock` 不随事务走、必须显式。正常路径下
+      `sales.py` / `purchase.py` 的 finally 都已经释放（实测核对过 100% 覆盖），
+      但"覆盖得对"这件事不该靠人工审计来维持 —— 这里做**最后一道闸**：
+      只要账上还挂着锁，就判定这条连接不可复用 ⇒ 返回 False，调用方丢弃它。
+      丢弃会让 SQL Server 释放该会话的全部锁，代价只是下次重建一条连接（25ms）。
+      ★ 为什么不用"查本会话持有的锁"：SQL Server 2008 没有这个轻量视图，
+        而 `sp_releaseapplock` 也不支持通配；自己记账是唯一无额外往返的做法。
+    """
+    try:
+        conn.rollback()
+    except Exception:  # noqa: BLE001
+        return False
+    if _lock_pending(conn):
+        return False
+    return True
+
+
+def _discard(pooled):
+    global _pool_size
+    _lock_forget(pooled.conn)
+    try:
+        pooled.conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    with _pool_lock:
+        _pool_size = max(0, _pool_size - 1)
+
+
 @contextmanager
 def session(cfg):
-    conn = connect(cfg)
+    """取一条连接供本次 op 使用；正常结束归还线程本地池，异常则丢弃重建。
+
+    ★ 语义与改造前**完全一致**（调用方依旧 `with session(cfg) as conn:`），
+      唯一区别是连接被复用而不是每次新建 —— 所以所有既有调用点零改动。
+    ★ `own=True` 只给"必须独立连接、且绝不能污染池"的场景用；
+      目前没有这种场景（capabilities 的探活也走池 —— 库真挂时池里的连接一样会抛）。
+    """
+    key = _conn_key(cfg)
+    pooled = getattr(_POOL, "slot", None)
+
+    # 复用条件：同线程、同身份、连接还在
+    if pooled is not None and pooled.key == key:
+        conn = pooled.conn
+    else:
+        # 换身份（账套路由/热切换）⇒ 旧连接归还前先清理，避免带着别的库的会话状态
+        if pooled is not None:
+            if not _reset_for_reuse(pooled.conn):
+                _discard(pooled)
+            _POOL.slot = None
+        pooled = _new_pooled(cfg)
+        conn = pooled.conn
+
+    ok = False
     try:
         yield conn
+        ok = True
     finally:
-        conn.close()
+        if ok:
+            if _reset_for_reuse(conn):
+                _POOL.slot = pooled        # 留作下次复用
+            else:
+                _discard(pooled)           # 状态不可信 ⇒ 丢弃，下次重建
+                _POOL.slot = None
+        else:
+            # 异常路径：连接可能处在半途状态，**丢弃**最安全。
+            # 这不是性能问题 —— 异常本就是少数路径，重开一条才 25ms。
+            _discard(pooled)
+            _POOL.slot = None
+
+
+def pool_stats():
+    """当前线程是否有可复用连接 + 全进程池大小（诊断/压测用）。"""
+    pooled = getattr(_POOL, "slot", None)
+    with _pool_lock:
+        size = _pool_size
+    with _held_lock:
+        pending = sum(len(v) for v in _HELD_LOCKS.values())
+    return {"thread_has_conn": pooled is not None, "pool_size": size,
+            "max": POOL_MAX, "locks_pending": pending}
 
 
 def q1(cur, sql, params=None):
     cur.execute(sql, params or ())
     return cur.fetchone()
+
 
 
 # ================================================== 单据取号（并发安全）
@@ -87,15 +276,31 @@ def acquire_number_lock(cur, resource, timeout_ms=APPLOCK_TIMEOUT_MS):
     """
     row = q1(cur, ACQ_APPLOCK, (resource, int(timeout_ms)))
     rc = int(row[0]) if row else -1
-    return rc in (0, 1)
+    if rc in (0, 1):
+        # ★ 记账：这条连接现在握着这把锁。会话级锁不随事务走，
+        #   唯一能保证它被还回去的就是"回池前查账"（见 _reset_for_reuse）。
+        _lock_mark(cur.connection, resource, True)
+        return True
+    return False
 
 
 def release_number_lock(cur, resource):
-    """释放应用锁。释放失败不该影响业务结果，所以吞掉异常。"""
+    """释放应用锁。释放失败不该影响业务结果，所以吞掉异常。
+
+    ★ 无论成功与否都**销账**：release 抛异常时锁大概率已经不在了
+      （连接断了/已被丢弃），此时若继续记账，会把一条本来干净的连接
+      永久判成"不可复用"——那是拿性能换一个不存在的风险。
+      真没释放掉的情况由"丢弃连接"兜底（见 _discard）。
+    """
     try:
         cur.execute(REL_APPLOCK, (resource,))
     except Exception:  # noqa: BLE001
         pass
+    finally:
+        try:
+            _lock_mark(cur.connection, resource, False)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def next_bill_number(cur, bill_na_id, database="", kind="", max_sql=None, prefix_sql=None):

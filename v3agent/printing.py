@@ -121,6 +121,13 @@ def print_bill(cur, cfg, bill_no, mode="system", copies=1, printer=None, fmt=Non
     payload = render_bill_text(bill)
     mode = str(mode or "system").lower()
     printer = str(printer or "").strip()
+    # ★ 打印机名要过一道脏字符检查（2026-10-12）：它是这样送进 ShellExecuteExW 的 ——
+    #   `lpParameters = '"%s"' % printer`，名字里带一个引号或换行就能把那对引号顶破、
+    #   参数被拆成两截。正常路径这个名字来自 capabilities 列出的打印机，不会脏；
+    #   但 op 的入参是**客户端拼的**，按外部输入处理。
+    if any(ch in printer for ch in ('"', "'", "`", "\r", "\n")):
+        raise ValueError("打印机名含非法字符，请从列表里选一台，不要手填")
+    printer = printer[:128]
     fmt = str(fmt or "").strip()
     result = {"billNo": bill_no, "mode": mode, "payload": payload}
     if printer:
@@ -153,7 +160,12 @@ def print_bill(cur, cfg, bill_no, mode="system", copies=1, printer=None, fmt=Non
         path = os.path.join(tempfile.gettempdir(), "v3print_%s.txt" % str(bill_no).replace("/", "_"))
         with open(path, "w", encoding="utf-8-sig", newline="\r\n") as fh:
             fh.write(payload)
-        for _ in range(max(int(copies or 1), 1)):
+        # ★ 份数封顶（2026-10-12）：原来是 `range(max(int(copies or 1), 1))` ——
+        #   只有下限没有上限，`copies=99999` 就是在这台客户机上连投 99999 次
+        #   ShellExecute（每投一次等一次打印机句柄），既占死 print 那道闸，
+        #   也是真的会往出纸口堆几十摞纸。上限给 20 份：单据场景一次最多也就一沓。
+        n_copies = max(1, min(int(copies or 1), 20))
+        for _ in range(n_copies):
             if printer:
                 _print_to(path, printer)
             else:

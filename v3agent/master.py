@@ -177,11 +177,19 @@ def _like_clause(fields, kw, args):
             这里只填进 SQL 文本的是 `%s` 本身，真正的值不拼进来）。
 
     返回形如：`(hpbh LIKE %s OR hpmc LIKE %s)`，其中 `%s` 是给 pymssql 的占位符。
+
+    ★★ 关键字里的 LIKE 通配符必须转义（2026-10-12，与 product.py 同一口径）：
+      SQL Server 的 LIKE 里 `%` 匹配任意串、`_` 匹配任意单字、`[` 开字符类。
+      不转义时用户搜一个 `%` 就等于"匹配所有"（几万条档案一次全捞出来，
+      还顺带把 `truncated`/`limit` 那套分页判断绕过去），搜 `_` 会命中所有单字占位。
+      这不是注入（值始终走参数绑定），是**语义被用户的输入改写**。
+      product.py 从第一天就转义了，这一份没有 ⇒ 客户/供应商/单据行搜索与货品搜索行为不一致。
     """
+    esc = str(kw).replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
     parts = []
     for f in fields:
         parts.append("ISNULL(%s,'') LIKE %%s" % f)
-        args.append("%" + str(kw) + "%")
+        args.append("%" + esc + "%")
     return "(" + " OR ".join(parts) + ")"
 
 

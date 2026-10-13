@@ -22,6 +22,14 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根（跟随脚本位置，可整体搬迁）
 NAME = "V3AgentGui"
+# ★★ 图标必须在这里给，不能只改 V3AgentGui.spec（2026-10-12 踩到的坑）：
+#   本脚本走的是 `python -m PyInstaller <入口.py> --参数…` 这条**命令行**路，
+#   PyInstaller 在命令行模式下**会忽略仓库里那份 .spec** ——
+#   所以只在 spec 里写 icon= 等于没写（日志里那句 "Copying icon to EXE"
+#   拷的是 PyInstaller 自带的默认图标，不是我们的）。
+#   同一个 ico 还要 --add-data 进包：exe 自身的图标是编译期嵌的，
+#   而**窗口左上角**那个要运行时 iconbitmap 才认（见 agent_gui.app_icon_path）。
+ICON = os.path.join(ROOT, "assets", "icons", "v3agent.ico")
 
 
 def pick_python():
@@ -212,6 +220,11 @@ def main():
         d = os.path.join(ROOT, sub)
         os.makedirs(d, exist_ok=True)
 
+    # ★ 图标缺了直接停：否则会打出一份"默认图标"的 exe，装到客户机上才发现，
+    #   还得整套重来一遍（打包本身不便宜）。
+    if not os.path.isfile(ICON):
+        raise SystemExit("找不到图标：%s" % ICON)
+
     # 1) 挪走 build 缓存目录
     cache = os.path.join(ROOT, "build", NAME)
     if os.path.isdir(cache):
@@ -244,6 +257,12 @@ def main():
         PY, "-m", "PyInstaller", "--noconfirm", "--onefile", "--noconsole",
         "--name", NAME,
         "--paths", ROOT,
+        # ★★ exe 自身的图标（桌面/任务栏/资源管理器）。缺了它，装到客户机上
+        #   就是 PyInstaller 那个默认图标 —— 用户会认不出这是哪个程序。
+        "--icon", ICON,
+        # ★ 同一个 ico 也放进包：运行时要给**窗口左上角**设图标
+        #   （exe 图标是编译期嵌的，不会自动成为窗口图标）。
+        "--add-data", "%s;assets/icons" % ICON,
         # ★★ 打进包里的是**空身份模板**，不是本地那份 config.json（P1-4，2026-09-26）。
         #   原来 `--add-data config.json;.` 会把开发者机器上的真身份
         #   （agent.name=shiwantongda、sql.database=tongda、真 secret）嵌进 _MEIPASS，

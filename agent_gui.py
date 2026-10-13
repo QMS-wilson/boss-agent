@@ -28,6 +28,7 @@
 
 import json
 import os
+import re
 import sys
 import time
 import threading
@@ -41,15 +42,89 @@ except Exception:  # noqa: BLE001
 
 APP_TITLE = "V3 本地 Agent 控制台"
 
+# ---- 窗口尺寸的唯一出处（2026-10-13；依据 scripts/probe-gui-fit.py 量的数）----
+WIN_W, WIN_H = 1704, 960          # 初始：两页需求取大（含首页常驻区的动作条）
+WIN_MIN_W, WIN_MIN_H = 1150, 660  # 地板：也是 minsize，也是"旧记录比这小就忽略"
+
+
+def _init_dpi():
+    """声明 DPI 感知：高分屏（125%/150%）下窗口与控件不再发虚。
+
+    ★ 必须赶在建根窗口**之前**调用 —— Tk 一旦按系统缩放建过窗口，再声明也晚了。
+    ★ 与 v3agent/yxparts/ui.py 的 _init_dpi() 用同一套写法：那个模块里本来就有，
+      只有控制台页缺 —— 结果是同一个程序里燕秀页清晰、控制台页发虚。
+    """
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:  # noqa: BLE001
+        pass          # 老系统没有 shcore.dll，静默跳过
+
+
+def app_icon_path():
+    """窗口图标 .ico 的路径。
+
+    ★ 为什么还要单独找一次：PyInstaller 打包时 exe 自己的图标是**编译期嵌进去的**，
+      但 Tk 窗口默认仍显示 Tcl/Tk 那个图标 —— 必须在运行时显式 iconbitmap 一次。
+      onefile 下资源在 sys._MEIPASS，开发态在 assets/icons/。
+    """
+    for d in (getattr(sys, "_MEIPASS", "") or "", base_dir(),
+              os.path.join(base_dir(), "assets", "icons")):
+        if not d:
+            continue
+        for n in ("v3agent.ico", "v3agent_A.ico"):
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _set_window_icon(root):
+    p = app_icon_path()
+    if not p:
+        return
+    try:
+        root.iconbitmap(default=p)
+    except Exception:  # noqa: BLE001
+        try:
+            root.iconbitmap(p)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _default_geometry(root):
+    """窗口初始尺寸 —— 一个数说了算，切页不再变。
+
+    ★ 原来这里挂着**四个**互相不服的尺寸（本函数 1020x830、恢复地板 900x640、
+      切到燕秀页时 `_fit_window` 兜底 1150x660、燕秀独立窗 1360x800），
+      表现就是"每切一次页、每重开一次，窗口大小都在变"。
+    ★ 1704 x 902 是**量出来的**（`scripts/probe-gui-fit.py`，两页各自需求取大）：
+        首页 操作行需 1542 / 账套行需 1637 / 带「在线用户」常驻区自然高 902
+        燕秀页 表格 13 列需 1704
+      改这两页的控件之后必须重跑那支门，否则加的按钮又会把内容挤出去。
+    ★ 小屏幕（1366x768 的笔记本）夹到屏内：宁可表格横向滚，也不让窗口超出桌面。
+    """
+    try:
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+    except Exception:  # noqa: BLE001
+        return "%dx%d" % (WIN_W, WIN_H)
+    return "%dx%d" % (max(WIN_MIN_W, min(WIN_W, sw - 40)),
+                      max(WIN_MIN_H, min(WIN_H, sh - 80)))
+
 
 def _make_root():
     """建根窗口：有 tkinterdnd2 就用它的 Tk（子控件才能收文件拖拽），否则退回普通 Tk。"""
+    root = None
     if TkinterDnD is not None:
         try:
-            return TkinterDnD.Tk()
+            root = TkinterDnD.Tk()
         except Exception:  # noqa: BLE001
-            pass
-    return tk.Tk()
+            root = None
+    if root is None:
+        root = tk.Tk()
+    _set_window_icon(root)
+    return root
 
 
 # ------------------------------------------------------------------ 路径
@@ -136,6 +211,98 @@ def _dm():
     return agent_daemon
 
 
+# ================================================================ 状态翻译（2026-10-12）
+#
+# ★★ 本次重构的核心。
+#
+# 后台 Agent 早就把"结论"写进 status.json 了：
+#   * state      —— 13 种明确取值，由 daemon 判定（agent_daemon.py L1107-1518 逐个赋值）
+#   * last_err   —— daemon 写好的**人话原因**（如"云端不认本机 agent.secret（多半是后台重置过密钥）"）
+#   * logs       —— 带 level 的最近 80 条，能数出"同一件事重复了多少次"
+#
+# 而旧界面只判 read_pid()（进程在不在）：进程活着就画绿色「后台运行中」，
+# 于是"一条请求都处理不了"的机器顶栏照样是绿的 —— 界面给出了最乐观的错误结论。
+# 下面这几张表只做"翻译"，不重新判断、不猜。
+
+# level: ok 正常 / warn 正在自动恢复 / err 要人动手 / stop 进程不在
+STATE_LEVEL = {
+    "启动中": ("ok", "正在启动"),
+    "连接中…": ("ok", "正在连接"),
+    "已连接": ("ok", "已连云端"),
+    "重连中": ("warn", "正在重连"),
+    "被顶号": ("warn", "被顶号"),
+    "已停止": ("stop", "未运行"),
+    "重复实例": ("err", "重复实例"),
+    "名称被占用": ("err", "名称被占用"),
+    "密钥不符": ("err", "密钥不符"),
+    "配置缺失": ("err", "配置缺失"),
+    "配置不可用": ("err", "配置不可用"),
+    "依赖缺失": ("err", "依赖缺失"),
+    "异常退出": ("err", "异常退出"),
+}
+
+# 每个"要人动手"的状态对应一条提示：结论（title）+ 处置（desc）。
+# ★ "acts" 是**历史遗留**：诊断条已经不放按钮了（动作统一收在操作行），
+#   它不参与当前渲染，留着是为了以后 C-2「在线用户」弹窗复用这套动作键。
+STATE_DIAG = {
+    "密钥不符": {
+        "title": "云端不认本机的 Agent 密钥",
+        "desc": "去云端后台『商户』页重新取这个商户的 Agent 密钥，填进『本机配置』的"
+                "『Agent 密钥』一栏，保存后重新启动 Agent。",
+        "acts": ["cfg", "log"],
+    },
+    "名称被占用": {
+        "title": "这个商户码已经被另一台机器占用",
+        "desc": "同一时刻一个商户码只允许一条连接。先确认该跑的是哪台机器："
+                "如果不是本机，在『本机配置』里把商户码改成本机对应的那一个。",
+        "acts": ["cfg", "log"],
+    },
+    "重复实例": {
+        "title": "本机有多个 Agent 在抢同一个商户码",
+        "desc": "多个实例会互相顶掉、谁都连不稳。点『停止全部 Agent』把本安装目录"
+                "清干净，再重新启动。",
+        "acts": ["stopall", "log"],
+    },
+    "被顶号": {
+        "title": "同一个商户码有两条连接在抢",
+        "desc": "点『停止全部 Agent』清掉本安装目录的残留，再重新启动；"
+                "如果本机确实只有一个实例，就去另一台机器上找。",
+        "acts": ["stopall", "log"],
+    },
+    "配置缺失": {
+        "title": "配置里缺必填项，Agent 起不来",
+        "desc": "在『本机配置』里补齐标出的那几项，保存后再启动。",
+        "acts": ["cfg", "log"],
+    },
+    "配置不可用": {
+        "title": "配置文件读不了或内容不对",
+        "desc": "打开配置文件核一下 JSON 是否完整（有没有多逗号、少引号）；"
+                "改完保存再启动。",
+        "acts": ["cfgfile", "cfg", "log"],
+    },
+    "依赖缺失": {
+        "title": "这台机器缺运行库",
+        "desc": "把依据行里的原始报错发给平台方 —— 这一类重装 exe 通常解决不了。",
+        "acts": ["log"],
+    },
+    "异常退出": {
+        "title": "Agent 上一次是异常退出的",
+        "desc": "打开日志看退出前最后几条，再点『启动』。",
+        "acts": ["log"],
+    },
+}
+
+# 状态带左侧那句话
+HEADLINE = {"ok": "服务正常", "warn": "正在自动恢复",
+            "err": "服务已中断", "stop": "未运行"}
+HEADLINE_FG = {"ok": "#15803d", "warn": "#b45309",
+               "err": "#b91c1c", "stop": "#64748b"}
+DOT_FG = {"ok": "#22c55e", "warn": "#f59e0b", "err": "#ef4444", "stop": "#94a3b8"}
+# 顶栏药丸徽章的 (底色, 字色)
+BADGE_BG = {"ok": ("#14532d", "#bbf7d0"), "warn": ("#78350f", "#fde68a"),
+            "err": ("#7f1d1d", "#fecaca"), "stop": ("#334155", "#e2e8f0")}
+
+
 # ------------------------------------------------------------------ 控制面板
 
 class Console:
@@ -144,8 +311,9 @@ class Console:
         # body = 真正装控件的容器（标签页里是子 Frame）；root 只做窗口级操作
         self.body = body if body is not None else root
         root.title(APP_TITLE)
-        root.geometry("820x600")
-        root.minsize(660, 480)
+        # ★ 尺寸由屏幕算（不再写死 820x600）：新界面内容更多，600 高会截断
+        root.geometry(_default_geometry(root))
+        root.minsize(WIN_MIN_W, WIN_MIN_H)
         self.dm = _dm()
         self.cfg_path = None
         self.cfg = None
@@ -162,7 +330,33 @@ class Console:
         self._sql_box = []
         self._sql_scan = None
         self._sql_tip = ""
+        # ---- 日志缓冲（2026-10-12：加了筛选/搜索后，日志不再直写控件）----
+        self._log_buf = []            # [(hh:mm:ss 或 daemon 的 t, msg, level)]
+        self._log_after = None        # after_idle 句柄（把同一批写入合并成一次重绘）
+        self._log_dirty = False
+        self._log_filter = "all"
+        self._log_paused = tk.BooleanVar(value=False)
+        self._log_kw = tk.StringVar()
+        self._log_chips = {}          # {"all"/"info"/...: 标签控件}（在弹窗里）
+        # ---- 日志改弹窗（2026-10-12）：主界面不再有日志区 ----
+        self.log_win = None           # 日志弹窗（Toplevel）；没开就是 None
+        self.txt = None               # 文本区在弹窗里，主界面没有它
+        self.btn_log = None           # 「查看日志」按钮（要更新错误计数角标）
+        # ---- 在线用户弹窗（2026-10-12，C-2）----
+        self.users_box = None
+        self.users_tree = None
+        # 换账套之后要通知燕秀面板丢掉物料库（面板是 main() 里延迟建的，只能挂回调）
+        self.on_db_switched = None
+
+        self.users_stat = None
+        self._users_rows = []
+        # ---- 诊断条（不放按钮；正常态整块不占位）----
+        self.diag = None
+        self._badge_level = "stop"
+        self._probe_after = None      # 「重新探测」结果回退定时器
+        self._setup_style()
         self._build_ui()
+        self._restore_geometry()
         self._load_config()
         self.discover_dbs()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -170,89 +364,672 @@ class Console:
         self.log("控制台已就绪。", "info")
         self.log("提示：关掉本窗口不会影响 Agent —— 它会继续在后台运行。", "meta")
 
+    # ---- 样式（2026-10-12）
+
+    def _setup_style(self):
+        """统一控件观感。
+
+        ★ 必须先 theme_use("clam")：vista / default 主题下 ttk 控件的 background
+          **根本不生效**（原生主题交给系统绘制），想自己配色只能换 clam。
+          这也是"按钮换成 ttk 之后还是灰的"的根因。
+        ★ Style 是全进程共享的 —— 燕秀页（v3agent/yxparts/ui.py）的 Treeview /
+          Combobox 会跟着一起变，改完必须两页都看一遍。
+        """
+        st = ttk.Style(self.root)
+        try:
+            st.theme_use("clam")
+        except Exception:  # noqa: BLE001
+            pass
+        ui = "Microsoft YaHei UI"
+        st.configure("TButton", font=(ui, 10), padding=(10, 5),
+                     background="#ffffff", foreground="#334155",
+                     bordercolor="#cbd5e1", borderwidth=1, relief="solid",
+                     focusthickness=0, focuscolor="#ffffff")
+        st.map("TButton",
+               background=[("disabled", "#f1f5f9"), ("pressed", "#e2e8f0"),
+                           ("active", "#f8fafc")],
+               foreground=[("disabled", "#94a3b8")],
+               bordercolor=[("disabled", "#e2e8f0")])
+        for name, bg, bd in (("Primary", "#16a34a", "#15803d"),   # 启动
+                             ("Stop", "#ea580c", "#c2410c"),      # 停止
+                             ("Accent", "#1d4ed8", "#1e40af"),    # 本机配置
+                             ("Danger", "#b91c1c", "#991b1b"),    # 停止全部 / 危险
+                             ("Teal", "#0f766e", "#115e59")):     # 现场自检
+            st.configure(name + ".TButton", font=(ui, 10, "bold"), padding=(13, 6),
+                         background=bg, foreground="#ffffff",
+                         bordercolor=bd, borderwidth=0, focuscolor=bg)
+            st.map(name + ".TButton",
+                   background=[("disabled", "#e8e8e8"), ("pressed", bd), ("active", bg)],
+                   foreground=[("disabled", "#9a9a9a")])
+        st.configure("TEntry", padding=(5, 4), fieldbackground="#ffffff")
+        st.configure("TCombobox", padding=(6, 3))
+        st.configure("TCheckbutton", font=(ui, 9), background="#ffffff",
+                     foreground="#334155")
+        st.map("TCheckbutton", background=[("active", "#ffffff")])
+
+        # ---- Treeview：行高必须按字体度量算（2026-10-13）----
+        # ★ 症状：在线用户那张表每行下半截被切，两行看就是一团重叠。
+        #   根因是 ttk.Treeview 的 rowheight 来自主题默认值，**不跟着你设的字体放大**，
+        #   而这台机是 微软雅黑 10 + 1.5 倍 DPI（量出来 linespace=35，默认行高装不下）。
+        #   ⇒ 写死一个数（比如 28）也一样会随字号/DPI 漂回去，所以按度量算。
+        # ★ Style 是全进程共享的：这一改同时作用到燕秀页的表格 —— 那张表的行
+        #   本来也被切，一起变好；改完两页都要看（scripts/check-gui-fit.py 会量）。
+        try:
+            from tkinter import font as _tkfont
+            from v3agent.ui_metrics import tree_rowheight
+            _tf = _tkfont.Font(family=ui, size=10)
+            st.configure("Treeview", rowheight=tree_rowheight(self.root),
+                         font=_tf, padding=(6, 3))
+            st.configure("Treeview.Heading",
+                         font=_tkfont.Font(family=ui, size=10, weight="bold"),
+                         padding=(6, 5))
+            self.tree_font = _tf
+        except Exception:  # noqa: BLE001  拿不到字体度量就用主题默认，不影响功能
+            self.tree_font = None
+
+    # ---- 窗口尺寸记忆
+    #
+    # ★ 为什么单独存一个文件、不写进 config.json：config.json 是**运行配置**
+    #   （商户身份 / 凭据 / 账套），把界面尺寸写进去会污染它，还会被
+    #   self._merged_cfg() 当成"用户改过的字段"回写 —— 那是真事故。
+
+    def _ui_state_path(self):
+        return os.path.join(runtime_dir(), "ui_state.json")
+
+    # 恢复尺寸时的下限：小于它就忽略旧记录（加了新控件之后小窗口会截断）
+    MIN_W, MIN_H = WIN_MIN_W, WIN_MIN_H   # ★ 与 minsize 同一个数，别再各写一份
+
+    def _restore_geometry(self):
+        try:
+            with open(self._ui_state_path(), "r", encoding="utf-8") as fh:
+                g = str((json.load(fh) or {}).get("geometry") or "").strip()
+        except Exception:  # noqa: BLE001
+            return False
+        m = re.match(r"^(\d+)x(\d+)([+-]-?\d+[+-]-?\d+)?$", g)
+        if not m:
+            return False
+        if int(m.group(1)) < self.MIN_W or int(m.group(2)) < self.MIN_H:
+            return False          # 旧记录太小 ⇒ 忽略它，用屏幕算出来的默认尺寸
+        try:
+            self.root.geometry(g)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _save_geometry(self):
+        try:
+            p = self._ui_state_path()
+            data = {}
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as fh:
+                        data = json.load(fh) or {}
+                except Exception:  # noqa: BLE001
+                    data = {}
+            data["geometry"] = self.root.geometry()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---- UI
 
     def _build_ui(self):
+        # ---------- 顶栏：品牌 + 状态药丸 ----------
         top = tk.Frame(self.body, bg="#0f172a")
         top.pack(fill="x")
         tk.Label(top, text=APP_TITLE, bg="#0f172a", fg="white",
-                 font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=14, pady=10)
-        self.lbl_state = tk.Label(top, text="检测中…", bg="#0f172a", fg="#94a3b8",
-                                  font=("Microsoft YaHei UI", 11, "bold"))
-        self.lbl_state.pack(side="right", padx=14)
+                 font=("Microsoft YaHei UI", 14, "bold")).pack(side="left", padx=16, pady=11)
+        self.lbl_ver = tk.Label(top, text="", bg="#0f172a", fg="#64748b",
+                                font=("Microsoft YaHei UI", 9))
+        self.lbl_ver.pack(side="right", padx=(0, 14))
+        self.badge = tk.Frame(top, bg="#334155")
+        self.badge.pack(side="right", padx=(0, 6), pady=10)
+        self.lbl_dot = tk.Label(self.badge, text="●", bg="#334155", fg="#94a3b8",
+                                font=("Microsoft YaHei UI", 10))
+        self.lbl_dot.pack(side="left", padx=(10, 4), pady=3)
+        self.lbl_state = tk.Label(self.badge, text="检测中…", bg="#334155", fg="#e2e8f0",
+                                  font=("Microsoft YaHei UI", 10, "bold"))
+        self.lbl_state.pack(side="left", padx=(0, 11), pady=3)
 
-        info = tk.Frame(self.body)
-        info.pack(fill="x", padx=12, pady=(10, 4))
-        self.lbl_agent = tk.Label(info, text="后台 Agent：检测中…", anchor="w",
-                                  font=("Microsoft YaHei UI", 10), fg="#0f172a")
-        self.lbl_agent.pack(fill="x")
-        self.lbl_cfg = tk.Label(info, text="配置：—", anchor="w", fg="#475569")
-        self.lbl_cfg.pack(fill="x")
-        self.lbl_conn = tk.Label(info, text="云端：—", anchor="w", fg="#475569")
-        self.lbl_conn.pack(fill="x")
-        self.lbl_stat = tk.Label(info, text="接收 — / 发送 — / 运行 —", anchor="w", fg="#475569")
-        self.lbl_stat.pack(fill="x")
+        # ---------- 提示 / 诊断条（只两行；不需要时整块不出现）----------
+        self._build_diag()
+
+        # ---------- 状态行 ----------
+        self._build_strip()
 
         # ---- 本机配置（首启填表 / 改配置，2026-09-26）----
         # ★ 为什么给它一个常驻槽位而不是弹模态窗：填到一半想去看状态、想点「重新发现」，
         #   模态窗会把人关在里面。面板收起时只是个空槽，不占地方。
         self.cfg_slot = tk.Frame(self.body)
-        self.cfg_slot.pack(fill="x", padx=12, pady=(0, 4))
+        self.cfg_slot.pack(fill="x", padx=14, pady=(2, 0))
         self._build_cfg_panel()
 
-        # ---- 账套选择（2026-09-24）----
-        # ★ 为什么放在 GUI 上：以前换账套要么手改 config.json、要么去点另一个目录的
-        #   exe（两份 exe 各带一套库、还共用同一个注册名互相踢），出错时数字看着都
-        #   正常但完全是另一套账。这里把选择收敛成一个动作，并且列表来自
-        #   sys.databases + 业务表四件套实测，不让手输错库名。
+        # ---------- 账套（2026-09-24）----------
+        self._build_dbrow()
+
+        # ---------- 操作（日志改弹窗了，不在这里占位置）----------
+        self._build_btns()
+
+    def _build_diag(self):
+        """提示条 —— 一行结论 + 指向；故障时多一行依据。**不放按钮**。
+
+        ★ 为什么去掉按钮：原来那四个（启动 / 本机配置 / 查看日志 / 停止全部）
+          与下面操作行和「更多」菜单里的**完全重复**，等于让用户在两处找同一个功能。
+          现在这里只负责"说清发生了什么、该去点哪里"，动作统一收在操作行。
+
+        ★ 也不新写诊断逻辑：只读 daemon 已经算好的 status.json
+          （state 13 种取值 + last_err 人话原因 + logs 重复次数）。
+        """
+        ui = "Microsoft YaHei UI"
+        self.diag = tk.Frame(self.body, bg="#eff6ff",
+                             highlightbackground="#93c5fd", highlightthickness=1)
+        self.diag_inner = tk.Frame(self.diag, bg="#eff6ff")
+        self.diag_inner.pack(fill="x", padx=12, pady=7)
+
+        line = tk.Frame(self.diag_inner, bg="#eff6ff")
+        line.pack(fill="x")
+        self.diag_ic = tk.Label(line, text="i", bg="#dbeafe", fg="#1e40af",
+                                font=(ui, 10, "bold"), width=2)
+        self.diag_ic.pack(side="left", padx=(0, 9))
+        self.diag_title = tk.Label(line, text="", bg="#eff6ff", fg="#1e40af",
+                                   font=(ui, 11, "bold"), anchor="w")
+        self.diag_title.pack(side="left")
+        self.diag_desc = tk.Label(line, text="", bg="#eff6ff", fg="#1e3a8a",
+                                  font=(ui, 9), anchor="w", justify="left",
+                                  wraplength=700)
+        self.diag_desc.pack(side="left", padx=(9, 0))
+        self.diag_ev = tk.Label(self.diag_inner, text="", bg="#dbeafe", fg="#1d4ed8",
+                                font=("Consolas", 9), anchor="w", justify="left",
+                                wraplength=780, padx=8, pady=3)
+        # 依据行刻意不 pack —— 由 _render_diag() 决定要不要出现
+
+    def _build_strip(self):
+        """状态行 —— 就一行：左边一句结论，右边一串事实。
+
+        ★ 原来是四行散文本 + 四个指标块（要 90px 高）。压成一行之后，
+          日志区才拿得到足够高度，不会再有"显示不全"。
+        """
+        ui = "Microsoft YaHei UI"
+        strip = tk.Frame(self.body, bg="#ffffff")
+        strip.pack(fill="x", padx=14, pady=(10, 0))
+        self.strip = strip
+        self.lbl_headline = tk.Label(strip, text="检测中…", bg="#ffffff", fg="#0f172a",
+                                     font=(ui, 15, "bold"), anchor="w")
+        self.lbl_headline.pack(side="left")
+        self.lbl_facts = tk.Label(strip, text="", bg="#ffffff", fg="#64748b",
+                                  font=(ui, 10), anchor="w")
+        self.lbl_facts.pack(side="left", padx=(14, 0))
+
+    def _build_dbrow(self):
+        """账套选择（2026-09-24）。
+
+        ★ 为什么放在 GUI 上：以前换账套要么手改 config.json、要么去点另一个目录的
+          exe（两份 exe 各带一套库、还共用同一个注册名互相踢），出错时数字看着都
+          正常但完全是另一套账。这里把选择收敛成一个动作，列表来自
+          sys.databases + 业务表四件套实测，不让手输错库名。
+        """
+        ui = "Microsoft YaHei UI"
         dbrow = tk.Frame(self.body)
-        dbrow.pack(fill="x", padx=12, pady=(0, 6))
-        tk.Label(dbrow, text="账套", font=("Microsoft YaHei UI", 10, "bold"),
+        dbrow.pack(fill="x", padx=14, pady=(9, 0))
+        tk.Label(dbrow, text="账套", font=(ui, 10, "bold"),
                  fg="#0f172a").pack(side="left")
-        self.cmb_db = ttk.Combobox(dbrow, width=24, state="readonly", values=[])
+        self.cmb_db = ttk.Combobox(dbrow, width=16, state="readonly", values=[])
         self.cmb_db.pack(side="left", padx=6)
-        tk.Button(dbrow, text="切换账套", width=10, bg="#7c3aed", fg="white",
-                  font=("Microsoft YaHei UI", 10, "bold"),
-                  command=self.switch_db).pack(side="left")
-        tk.Button(dbrow, text="重新发现", width=10,
-                  font=("Microsoft YaHei UI", 10),
-                  command=self.discover_dbs).pack(side="left", padx=6)
-        self.lbl_db = tk.Label(dbrow, text="当前：—", anchor="w", fg="#475569")
-        self.lbl_db.pack(side="left", padx=8)
+        for text, cmd, bg in (("切换", self.switch_db, "#7c3aed"),
+                              ("重新发现", self.discover_dbs, "#ffffff")):
+            fg = "#334155" if bg == "#ffffff" else "#ffffff"
+            b = tk.Button(dbrow, text=text, command=cmd, bg=bg, fg=fg,
+                          relief="flat", bd=0, width=8, padx=4, pady=3, cursor="hand2",
+                          font=(ui, 9, "bold" if bg != "#ffffff" else "normal"),
+                          activebackground=bg, activeforeground=fg)
+            if bg == "#ffffff":
+                b.configure(highlightbackground="#cbd5e1", highlightthickness=1,
+                            activebackground="#eff6ff")
+            b.pack(side="left", padx=(0, 5))
+        # ★ 这两个标签原来一个 pack 左边、一个 pack 右边挤在同一行 ——
+        #   「允许读 3 本：shiwantongda、tongda、geshi」这种长文案一来，就和右侧
+        #   「配置：<路径> Agent 名：…」直接重叠（2026-10-13 截图才看得见）。
+        #   次要信息降到下面一行小字，并按窗口宽度回行，不跟主操作抢同一行。
+        # ★ 必须**直接建在这个框里**：Tk 不允许把控件 pack 进不是它父容器的框
+        #   （先建在 dbrow 再 `pack(in_=db_sub)` 会直接 TclError，本轮撞过）。
+        self.db_sub = tk.Frame(self.body, bg="#ffffff")
+        self.db_sub.pack(fill="x", padx=14, pady=(2, 0))
+        self.lbl_db = tk.Label(self.db_sub, text="当前：—", anchor="w", fg="#64748b",
+                               font=(ui, 9), justify="left")
+        self.lbl_db.pack(side="top", anchor="w")
+        self.lbl_cfg = tk.Label(self.db_sub, text="配置：—", anchor="w", fg="#94a3b8",
+                                font=(ui, 9), justify="left")
+        self.lbl_cfg.pack(side="top", anchor="w")
+        self._db_sub_bind_width()
+        self.body.bind("<Configure>", lambda e: self._db_sub_bind_width(e.width), add="+")
 
+    def _db_sub_bind_width(self, width=None):
+        """让第二行小字跟着窗口宽度回行（不回行就会顶出右边界，看着像被裁）。"""
+        for lbl in (getattr(self, "lbl_db", None), getattr(self, "lbl_cfg", None)):
+            if lbl is not None:
+                try:
+                    lbl.configure(wraplength=max(400, int(width or 0) - 40))
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _build_btns(self):
+        """操作行：常用功能平铺 ＋「更多 ▾」收纳低频功能。
+
+        ★ 为什么这次用菜单：要整洁就得取舍 —— 常用的一眼可见，
+          低频（看日志文件 / 开配置文件 / 停全部实例）收进菜单，不占版面。
+        ★ 刻意**保留**"启动/停止 用 disabled 联动"这套机制（见 _refresh）——
+          它本来就是对的。若改成"隐藏另一个按钮"，_refresh 必须同步改，
+          否则 configure 到已销毁的控件 ⇒ 启停按钮直接失效。
+        """
+        ui = "Microsoft YaHei UI"
         btns = tk.Frame(self.body)
-        btns.pack(fill="x", padx=12, pady=8)
-        self.btn_start = tk.Button(btns, text="启动后台 Agent", width=15, bg="#16a34a", fg="white",
-                                   font=("Microsoft YaHei UI", 10, "bold"), command=self.start)
-        self.btn_start.pack(side="left")
-        self.btn_stop = tk.Button(btns, text="停止后台 Agent", width=15, bg="#ea580c", fg="white",
-                                  font=("Microsoft YaHei UI", 10, "bold"), command=self.stop)
-        self.btn_stop.pack(side="left", padx=8)
-        tk.Button(btns, text="刷新状态", width=10, command=self.refresh_now,
-                  font=("Microsoft YaHei UI", 10)).pack(side="left")
-        tk.Button(btns, text="查看日志文件", width=12, command=self.open_log,
-                  font=("Microsoft YaHei UI", 10)).pack(side="left", padx=8)
-        tk.Button(btns, text="打开配置文件", width=12, command=self.open_cfg,
-                  font=("Microsoft YaHei UI", 10)).pack(side="left")
-        # ★ 界面里改配置 = 首启那条路（拷 exe 出来的人不该被要求会手写 JSON）
-        tk.Button(btns, text="本机配置", width=10, bg="#1d4ed8", fg="white",
-                  font=("Microsoft YaHei UI", 10, "bold"),
-                  command=lambda: self.show_cfg(True)).pack(side="left", padx=8)
-        tk.Button(btns, text="现场自检", width=12, bg="#0f766e", fg="white", command=self.run_selfcheck,
-                  font=("Microsoft YaHei UI", 10, "bold")).pack(side="left", padx=8)
+        btns.pack(fill="x", padx=14, pady=10)
 
-        bar = tk.Frame(self.body)
-        bar.pack(fill="x", padx=12)
-        tk.Label(bar, text="后台 Agent 最近日志（本窗口只是显示，关掉不影响它）",
-                 anchor="w", fg="#64748b", font=("Microsoft YaHei UI", 9)).pack(fill="x")
+        def mk(text, cmd, bg, bold=False):
+            """扁平按钮。★ 用 tk.Button 而不是 ttk.Button ——
+            clam 主题下的 ttk 按钮是灰扁方块，观感反而比原生更朴素；
+            tk.Button 配 relief="flat" 才能做出纯色扁平块。"""
+            fg = "#334155" if bg == "#ffffff" else "#ffffff"
+            b = tk.Button(btns, text=text, command=cmd, bg=bg, fg=fg,
+                          relief="flat", bd=0, padx=15, pady=7, cursor="hand2",
+                          font=(ui, 10, "bold" if bold else "normal"),
+                          activebackground=bg, activeforeground=fg,
+                          disabledforeground="#9aa4b2")
+            if bg == "#ffffff":
+                b.configure(highlightbackground="#cbd5e1", highlightthickness=1,
+                            activebackground="#eff6ff")
+            b.pack(side="left", padx=(0, 8))
+            return b
 
-        self.txt = scrolledtext.ScrolledText(self.body, height=18, state="disabled",
-                                             font=("Consolas", 10), bg="#f8fafc",
-                                             fg="#0f172a", relief="flat")
-        self.txt.pack(fill="both", expand=True, padx=12, pady=(2, 12))
+        # ★ 主操作：实心大按钮。仍由 _refresh 设 state（既有 disabled 联动不变）
+        self.btn_start = mk("启动后台 Agent", self.start, "#16a34a", bold=True)
+        self.btn_stop = mk("停止后台 Agent", self.stop, "#ea580c", bold=True)
+        tk.Frame(btns, width=1, bg="#cbd5e1").pack(side="left", fill="y", padx=4)
+        mk("重新探测", self.probe_now, "#ffffff")
+        mk("本机配置", lambda: self.show_cfg(True), "#1d4ed8", bold=True)
+        mk("现场自检", self.run_selfcheck, "#0f766e", bold=True)
+        # ★ 日志搬进弹窗了，这里只留一个入口；按钮文字带错误计数角标
+        self.btn_log = mk("查看日志", self.open_log_window, "#ffffff")
+        # ★「在线用户」不再是按钮：它已经搬进首页常驻区（见 _build_users_panel），
+        #   留着就是同一个功能两处入口。
+        self._build_users_panel()
+
+        mb = ttk.Menubutton(btns, text="更多 ▾", width=9)
+        menu = tk.Menu(mb, tearoff=0)
+        menu.add_command(label="打开日志文件（原始 txt）", command=self.open_log)
+        menu.add_command(label="打开配置文件", command=self.open_cfg)
+        menu.add_separator()
+        menu.add_command(label="停止全部 Agent（清残留）", command=self.stop_all)
+        mb["menu"] = menu
+        mb.pack(side="left", padx=(0, 8))
+
+    # ---- 日志弹窗（2026-10-12：从主界面搬出来）
+    #
+    # ★ 为什么搬：日志区要 300px 高，主界面装不下 —— 那正是"显示不全"的根源。
+    #   搬走之后主界面只剩四行，而且**日志和操作可以同时看着**（边点启动边看）。
+    # ★ 非模态（不加 grab_set）：加了 grab 就变成"必须先关日志窗才能点主界面"，
+    #   正好把"边看边操作"这个唯一的好处毁掉。
+
+    def open_log_window(self):
+        """打开日志窗口；已经开着就把它提到前面（不重复开第二个）。"""
+        if self.log_win is not None:
+            try:
+                if self.log_win.winfo_exists():
+                    self.log_win.lift()
+                    self.log_win.focus_set()
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            self.log_win = None
+
+        ui = "Microsoft YaHei UI"
+        win = tk.Toplevel(self.root)
+        self.log_win = win
+        win.title("后台 Agent 日志 · " + APP_TITLE)
+        win.geometry("900x520")
+        win.minsize(640, 300)
+        _set_window_icon(win)
+
+        bar = tk.Frame(win)
+        bar.pack(fill="x", padx=12, pady=(10, 0))
+        for key, text in (("all", "全部"), ("info", "信息"), ("req", "请求"),
+                          ("warn", "警告"), ("error", "错误")):
+            chip = tk.Label(bar, text=text, fg="#334155", bg="#ffffff",
+                            font=(ui, 9), padx=9, pady=2, cursor="hand2",
+                            highlightbackground="#cbd5e1", highlightthickness=1)
+            chip.pack(side="left", padx=(0, 5))
+            chip.bind("<Button-1>", lambda _e, k=key: self.set_log_filter(k))
+            self._log_chips[key] = chip
+        ttk.Checkbutton(bar, text="暂停", variable=self._log_paused,
+                        command=self._render_log).pack(side="right")
+        ttk.Button(bar, text="清空", width=5,
+                   command=self.clear_log).pack(side="right", padx=6)
+        ent = ttk.Entry(bar, textvariable=self._log_kw, width=20)
+        ent.pack(side="right")
+        ent.bind("<KeyRelease>", lambda _e: self._render_log())
+        tk.Label(bar, text="搜索", fg="#64748b",
+                 font=(ui, 9)).pack(side="right", padx=(0, 4))
+
+        self.txt = scrolledtext.ScrolledText(win, state="disabled",
+                                             font=("Consolas", 10), bg="#ffffff",
+                                             fg="#0f172a", relief="flat",
+                                             highlightbackground="#e2e8f0",
+                                             highlightthickness=1)
+        self.txt.pack(fill="both", expand=True, padx=12, pady=(6, 12))
         for tag, color in (("info", "#334155"), ("ok", "#15803d"), ("warn", "#b45309"),
                            ("error", "#b91c1c"), ("req", "#1d4ed8"), ("meta", "#64748b")):
             self.txt.tag_config(tag, foreground=color)
+        win.protocol("WM_DELETE_WINDOW", self._close_log_window)
+        self.set_log_filter(self._log_filter)     # 重绘 + 同步 chip 选中态
+
+    def _close_log_window(self):
+        """关掉弹窗 —— ★ 只是不看了：缓冲照收，主界面按钮上的角标继续跳。"""
+        win, self.log_win = self.log_win, None
+        self.txt = None
+        self._log_chips = {}
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ---- 在线用户弹窗（2026-10-12 · C-2）
+    #
+    # ★ 数据来自云端（/agent/sessions）：登录会话的所有权在云端 ——
+    #   本地只是把它取过来显示、并把"踢出"这个动作转达回去。
+    # ★ 用**现有的** agent.secret 调，不为这个功能新发一套密钥
+    #   （少一套密钥 = 少一处会在换机器时忘记改的东西）。
+    # ★ 三个动作分开给：踢这条 / 踢该账号全部 / 禁用账号 ——
+    #   合成一个必然出现"我只想踢他下线，结果把人账号禁了"。
+
+    def _cloud_base(self):
+        """云端 http 基地址（由 relay_url 换算）。"""
+        st = self.dm.read_status() or {}
+        url = str(st.get("relay_url") or "").strip() or str(
+            ((self.cfg or {}).get("agent") or {}).get("relay_url") or "")
+        if not url:
+            return ""
+        base = url.replace("wss://", "https://").replace("ws://", "http://")
+        return base.split("/ws/")[0].rstrip("/")
+
+    def _cloud_post(self, path, payload=None, timeout=8):
+        """带 agent 身份调云端；返回 (ok, 数据 或 失败原因)。"""
+        import urllib.error
+        import urllib.request
+        base = self._cloud_base()
+        if not base:
+            return False, "云端地址未知（配置里没有 agent.relay_url）"
+        a = (self.cfg or {}).get("agent") or {}
+        body = dict(payload or {})
+        body["agent"] = a.get("name") or ""
+        body["secret"] = a.get("secret") or ""
+        if not body["agent"] or not body["secret"]:
+            return False, "配置里缺 agent.name 或 agent.secret"
+        req = urllib.request.Request(
+            base + path,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                data = json.loads(exc.read().decode("utf-8"))
+            except Exception:  # noqa: BLE001
+                data = {}
+            return False, str(data.get("error") or ("HTTP %d" % exc.code))
+        except Exception as exc:  # noqa: BLE001
+            return False, "连不上云端（%s）" % type(exc).__name__
+        if not data.get("ok"):
+            return False, str(data.get("error") or "云端返回失败")
+        return True, data
+
+    # ---- 在线用户（2026-10-13：从弹窗搬进主界面，做成常驻区）----
+    #
+    # ★ 为什么常驻、不要弹窗：这一页回答的是"谁在用我这本账"，是开机就该看见的状态。
+    #   藏在弹窗里 ⇒ 每次先点按钮、弹窗和主窗抢焦点、一关信息就没了。
+    #   形状照当年日志区那块：标题条 + 表格 + 动作条。
+    # ★ 数据来自云端（/agent/sessions）：登录会话的所有权在云端 ——
+    #   本地只是把它取过来显示、并把"踢出"这个动作转达回去。
+    # ★ 三个动作分开给：踢这条 / 踢该账号全部 / 禁用账号 ——
+    #   合成一个必然出现"我只想踢他下线，结果把人账号禁了"。
+
+    USERS_HEADS = (("state", "状态"), ("who", "账号"), ("kind", "类型"),
+                   ("db", "账套"), ("dev", "设备 / 端"), ("ip", "来源 IP"),
+                   ("login", "登录于"), ("idle", "最后活跃"))
+
+    def _build_users_panel(self):
+        ui = "Microsoft YaHei UI"
+        box = tk.Frame(self.body, bg="#ffffff",
+                       highlightbackground="#cbd5e1", highlightthickness=1)
+        box.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        self.users_box = box
+
+        bar = tk.Frame(box, bg="#f8fafc")
+        bar.pack(fill="x")
+        tk.Label(bar, text="在线用户", bg="#f8fafc", fg="#0f172a",
+                 font=(ui, 11, "bold")).pack(side="left", padx=(10, 0), pady=6)
+        tk.Label(bar, text="正在使用 App 的 V3 操作员", bg="#f8fafc",
+                 fg="#64748b", font=(ui, 9)).pack(side="left", padx=(8, 0))
+        self.users_stat = tk.Label(bar, text="—", bg="#f8fafc", fg="#475569", font=(ui, 9))
+        self.users_stat.pack(side="right", padx=(0, 10))
+        ttk.Button(bar, text="刷新", width=7,
+                   command=self._reload_users).pack(side="right", padx=8)
+
+        cols = [k for k, _t in self.USERS_HEADS]
+        self.users_tree = ttk.Treeview(box, columns=cols, show="headings", height=7)
+        for key, text in self.USERS_HEADS:
+            self.users_tree.heading(key, text=text)
+            self.users_tree.column(key, width=90, anchor="w", stretch=(key == "who"))
+        self.users_tree.pack(fill="both", expand=True, padx=8, pady=(6, 0))
+        self.users_tree.tag_configure("off", foreground="#94a3b8")
+
+        acts = tk.Frame(box, bg="#ffffff")
+        acts.pack(fill="x", padx=8, pady=8)
+
+        def abtn(text, cmd, bg="#ffffff"):
+            fg = "#334155" if bg == "#ffffff" else "#ffffff"
+            b = tk.Button(acts, text=text, command=cmd, bg=bg, fg=fg, relief="flat",
+                          bd=0, padx=12, pady=5, cursor="hand2",
+                          font=(ui, 10, "bold" if bg != "#ffffff" else "normal"),
+                          activebackground=bg, activeforeground=fg)
+            if bg == "#ffffff":
+                b.configure(highlightbackground="#cbd5e1", highlightthickness=1)
+            b.pack(side="left", padx=(0, 8))
+            return b
+
+        abtn("踢出这条", self._kick_selected, "#ea580c")
+        abtn("踢出该账号全部", self._kick_user)
+        abtn("禁用账号", self._disable_user, "#b91c1c")
+        tk.Label(acts, text="踢出＝立刻断线（还能再登）；禁用＝以后不能登录",
+                 fg="#64748b", font=(ui, 9)).pack(side="left", padx=(6, 0))
+        # 等窗口真的摆开之后再取数：列宽要按可视宽算，早了就没有那个宽度
+        self.root.after(250, self._reload_users)
+
+    def _fit_users_columns(self, values):
+        """列宽按**这一屏真数据**量：放得下就一个都不截，放不下才从最宽的列收，
+        且只给真被收过的列补省略号。
+        ★ 原来这里写死 72/170/84/168/126/116/104，「设备 · 端」和「最后活跃」
+          在 1704 的窗口里都被切；夹个 300 上限更是把放得下的列也截了。
+        """
+        f = self.tree_font
+        tree = self.users_tree
+        if f is None or tree is None:
+            return
+        # 还没布局时 winfo_width() 是 1 ⇒ 那种情况下**不收缩**，按内容原样给宽，
+        # 否则首屏会把每一列都压成省略号（本轮就在这红过一次）
+        visible = tree.winfo_width() - 8 if tree.winfo_width() > 200 else None
+        need, floor = [], []
+        for i, (_k, text) in enumerate(self.USERS_HEADS):
+            head = f.measure(text) + 18
+            w = head
+            for row in values:
+                w = max(w, f.measure(str(row[i])) + 18)
+            need.append(max(56, w))
+            floor.append(max(56, head))          # 收到表头宽就停，别把「已踢出」压成「已…」
+        shrunk = [False] * len(need)
+        total = sum(need)
+        while total > visible:
+            cands = [i for i in range(len(need)) if need[i] > floor[i] + 8]
+            if not cands:
+                break
+            i = max(cands, key=lambda k: need[k])
+            cut = min(need[i] - floor[i], max(8, (total - visible) // 3))
+            need[i] -= cut
+            shrunk[i] = True
+            total = sum(need)
+        out = []
+        for row in values:
+            cells = []
+            for i, v in enumerate(row):
+                t = str(v)
+                if shrunk[i] and f.measure(t) > need[i] - 12:
+                    while t and f.measure(t + "…") > need[i] - 12:
+                        t = t[:-1]
+                    t = t.rstrip("（( :·-")
+                    cells.append((t + "…") if t else "…")
+                    continue
+                cells.append(t)
+            out.append(tuple(cells))
+        for i, (key, _t) in enumerate(self.USERS_HEADS):
+            tree.column(key, width=need[i], anchor="w", stretch=(key == "who"))
+        return out
+
+    @staticmethod
+    def _users_values(rows):
+        """会话记录 → 表格那 7 列的字（口径与三端页面共用的一份保持一致）。"""
+        out = []
+        for rec in rows:
+            sub = str(rec.get("sub") or "")
+            user = sub.split(":", 1)[1] if ":" in sub else sub
+            kinds = {"app": "App 账号", "v3": "V3 操作员", "wechat": "微信"}
+            kind = kinds.get(rec.get("kind")) or rec.get("kind") or "—"
+            # 设备：品牌·型号·端 拼一行（服务端解析好的，三处页面共用一份口径）
+            dev = " · ".join(x for x in (rec.get("brand"), rec.get("model"),
+                                         rec.get("client")) if x) or rec.get("platform") or "—"
+            out.append((
+                "已踢出" if rec.get("revoked") else ("在线" if rec.get("online") else "离线"),
+                "%s（%s）" % (rec.get("name") or user, user),
+                kind,
+                # ★ 账套（2026-10-14）：每本账有自己的操作员集合，不显示就答不出
+                #   "这个操作员此刻在哪本账上"。空串 = 该商户没登记账套清单。
+                rec.get("database") or "默认",
+                dev, rec.get("ip") or "—", _ts(rec.get("login_at")),
+                _idle(rec.get("idle_sec"))))
+        return out
+
+    def _reload_users(self):
+        if self.users_tree is None:
+            return
+        # ★ 只要 V3 操作员（kind=v3），**不拉平台账号**（2026-10-14）。
+        #   本地 Agent 服务的是"一家商户的一本账"，而平台账号（应用账号）属于
+        #   云端那一层、还可能跨商户 —— 露在客户机上既没用，又是一处泄露面。
+        #   要管平台账号，去云端后台。
+        ok, data = self._cloud_post("/agent/sessions", {"kind": "v3"})
+        for iid in self.users_tree.get_children():
+            self.users_tree.delete(iid)
+        if not ok:
+            self.users_stat.configure(text="读不到：%s" % data, fg="#b91c1c")
+            self._users_rows = []
+            return
+        rows = data.get("sessions") or []
+        st = data.get("stats") or {}
+        self._users_rows = rows
+        self.users_stat.configure(
+            text="共 %s 条 · 在线 %s" % (st.get("total", len(rows)), st.get("online", "—")),
+            fg="#475569")
+        for i, (vals, rec) in enumerate(zip(self._fit_users_columns(self._users_values(rows))
+                                            or self._users_values(rows), rows)):
+            self.users_tree.insert("", "end", iid=str(i), values=vals,
+                                   tags=() if rec.get("online") else ("off",))
+
+    def _selected_user(self):
+        sel = self.users_tree.selection() if self.users_tree else ()
+        if not sel:
+            messagebox.showinfo(APP_TITLE, "先在上面选中一行。")
+            return None
+        try:
+            return self._users_rows[int(sel[0])]
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _user_name(rec):
+        sub = str((rec or {}).get("sub") or "")
+        return sub.split(":", 1)[1] if ":" in sub else sub
+
+    def _kick_selected(self):
+        rec = self._selected_user()
+        if not rec:
+            return
+        user = self._user_name(rec)
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "踢出这一条会话？\n\n    %s（%s）\n\n"
+                "只断这一台设备；该账号在其他设备上的登录不受影响。"
+                % (rec.get("name") or user, rec.get("ip") or "—")):
+            return
+        ok, data = self._cloud_post("/agent/sessions/revoke", {"jti": rec.get("jti")})
+        self.log("踢出会话 %s：%s" % (user, "成功" if ok else data), "ok" if ok else "warn")
+        if not ok:
+            messagebox.showerror(APP_TITLE, str(data))
+        self._reload_users()
+
+    def _kick_user(self):
+        rec = self._selected_user()
+        if not rec:
+            return
+        user = self._user_name(rec)
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "踢出「%s」的**全部**会话？\n\n"
+                "他所有设备会立刻掉线，需要重新登录。\n"
+                "账号本身不受影响 —— 之后还能正常登录。\n\n"
+                "只想断这一台设备的话，请用「踢出这条」。" % user):
+            return
+        # ★ 传 subject（完整主体）而不是 username：
+        #   V3 操作员的主体是 `v3:<商户>:<编号>`，不是 `account:<编号>` ——
+        #   拿 username 拼的话，对 V3 操作员会 404「账号不存在」，
+        #   而用户看到的只是"踢不动"（2026-10-14 修）。
+        ok, data = self._cloud_post("/agent/sessions/revoke", {"subject": rec.get("sub")})
+        if ok:
+            self.log("已踢出「%s」全部会话（清 %s 条）" % (user, data.get("revoked")), "ok")
+        else:
+            self.log("踢出「%s」失败：%s" % (user, data), "warn")
+            messagebox.showerror(APP_TITLE, str(data))
+        self._reload_users()
+
+    def _disable_user(self):
+        rec = self._selected_user()
+        if not rec:
+            return
+        user = self._user_name(rec)
+        # ★ V3 操作员**没有**"禁用"这个概念，别给一个点了必然失败的按钮：
+        #   他的账号在客户机的财鲸 V3 里（UserInfo 表），云端管不着。
+        if str(rec.get("kind") or "") == "v3":
+            messagebox.showinfo(
+                APP_TITLE,
+                "「%s」是财鲸 V3 的操作员，不能在云端禁用。\n\n"
+                "要停用这个人：请在财鲸 V3 的「操作员」里停用他；\n"
+                "只想让他现在下线：用「踢出该账号全部」。" % user)
+            return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "禁用账号「%s」？\n\n"
+                "禁用 = 以后不能再登录，同时现有会话立刻失效。\n"
+                "如果只想让他下线、之后还能登，请用「踢出」。\n\n"
+                "账号不会被删除，之后可以在云端后台重新启用。" % user):
+            return
+        ok, data = self._cloud_post("/agent/accounts/disable",
+                                    {"username": user, "disabled": True})
+        if ok:
+            self.log("已禁用账号「%s」，清掉 %s 条会话" % (user, data.get("dropped")), "ok")
+        else:
+            self.log("禁用「%s」失败：%s" % (user, data), "warn")
+            messagebox.showerror(APP_TITLE, str(data))
+        self._reload_users()
 
     # ---- 本机配置（首启填表）
 
@@ -297,29 +1074,42 @@ class Console:
             self.cfg_vars[dotted] = (var, entry, kind)
         row = tk.Frame(box)
         row.pack(fill="x", pady=(6, 0))
-        tk.Button(row, text="保存并应用", width=13, bg="#16a34a", fg="white",
-                  font=("Microsoft YaHei UI", 10, "bold"),
-                  command=self.save_cfg).pack(side="left")
-        tk.Button(row, text="试连并列账套", width=13,
-                  font=("Microsoft YaHei UI", 10),
-                  command=self.probe_sql).pack(side="left", padx=6)
-        tk.Button(row, text="显示口令", width=10,
-                  font=("Microsoft YaHei UI", 10),
-                  command=self.toggle_pwd).pack(side="left")
-        tk.Button(row, text="收起", width=8, command=lambda: self.show_cfg(False),
-                  font=("Microsoft YaHei UI", 10)).pack(side="right")
+
+        def cbtn(text, cmd, bg, w, side="left", pad=(0, 6)):
+            fg = "#334155" if bg == "#ffffff" else "#ffffff"
+            b = tk.Button(row, text=text, command=cmd, bg=bg, fg=fg,
+                          relief="flat", bd=0, width=w, padx=6, pady=4, cursor="hand2",
+                          font=("Microsoft YaHei UI", 10,
+                                "bold" if bg != "#ffffff" else "normal"),
+                          activebackground=bg, activeforeground=fg,
+                          disabledforeground="#9aa4b2")
+            if bg == "#ffffff":
+                b.configure(highlightbackground="#cbd5e1", highlightthickness=1,
+                            activebackground="#eff6ff")
+            b.pack(side=side, padx=pad)
+            return b
+
+        cbtn("保存并应用", self.save_cfg, "#16a34a", 13)
+        cbtn("试连并列账套", self.probe_sql, "#ffffff", 13)
+        cbtn("显示口令", self.toggle_pwd, "#ffffff", 10)
+        cbtn("收起", lambda: self.show_cfg(False), "#ffffff", 8,
+             side="right", pad=(0, 0))
         self.cfg_panel.pack_forget()
 
     def show_cfg(self, open_it=True):
-        """展开/收起配置面板。填完或配置已经可用时就收起来，别挡着状态行。"""
+        """展开/收起配置面板。填完或配置已经可用时就收起来，别挡着状态行。
+
+        ★ 去掉两处 geometry 硬改（2026-10-12）。原来展开写死 820x780、
+          收起写死 820x600 —— 会把用户自己拉好的窗口尺寸顶掉，收起时又拉回 600。
+          现在只 pack / pack_forget，尺寸交给窗口自己伸；
+          用户调过的尺寸由 runtime/ui_state.json 记住并恢复。
+        """
         if open_it:
             if not self.cfg_panel.winfo_ismapped():
                 self.cfg_panel.pack(in_=self.cfg_slot, fill="x")
                 self._prefill_cfg()
-                self.root.geometry("820x780")
         else:
             self.cfg_panel.pack_forget()
-            self.root.geometry("820x600")
 
     def _read_disk_cfg(self):
         try:
@@ -496,12 +1286,109 @@ class Console:
             self.log("  没找到账套库 ⇒ 这台机器的财鲸V3 还没装好或账号没权限读，先让客户方补齐。", "warn")
 
     # ---- 日志
+    #
+    # ★ 2026-10-12 改造：从"直写 ScrolledText"改成"内存缓冲 + 按筛选重绘"。
+    #   原因：加了级别筛选与搜索之后，插入一条就得判断它是否命中当前筛选，
+    #   还要维护 chip 上的计数 —— 统一走"缓冲 → 重绘"最简单，也不会数错。
+    #   缓冲上限 1000 行，防止长时间运行把内存吃掉。
+
+    LOG_MAX = 1000
+    LOG_FILTERS = {
+        "all": None,
+        "info": ("info", "ok", "meta"),
+        "req": ("req",),
+        "warn": ("warn",),
+        "error": ("error",),
+    }
+
+    def _append_log(self, ts, msg, level="info"):
+        """只入缓冲并登记一次重绘 —— 同一批写入由 after_idle 合并成一次。"""
+        self._log_buf.append((ts or time.strftime("%H:%M:%S"), str(msg), level))
+        if len(self._log_buf) > self.LOG_MAX:
+            del self._log_buf[:len(self._log_buf) - self.LOG_MAX]
+        self._log_dirty = True
+        if self._log_after is None:
+            try:
+                self._log_after = self.root.after_idle(self._flush_log)
+            except Exception:  # noqa: BLE001
+                self._flush_log()
 
     def log(self, msg, level="info"):
+        """对外沿用旧签名，内部改走缓冲。"""
+        self._append_log(time.strftime("%H:%M:%S"), msg, level)
+
+    def _flush_log(self):
+        self._log_after = None
+        if not self._log_dirty:
+            return
+        self._log_dirty = False
+        self._update_log_badge()
+        if not self._log_paused.get():
+            self._render_log()
+
+    def set_log_filter(self, key):
+        self._log_filter = key if key in self.LOG_FILTERS else "all"
+        for k, chip in self._log_chips.items():
+            on = (k == self._log_filter)
+            chip.configure(bg="#0f172a" if on else "#ffffff",
+                           fg="#ffffff" if on else "#334155",
+                           highlightbackground="#0f172a" if on else "#cbd5e1",
+                           text=self._chip_text(k))
+        self._render_log()
+
+    def _chip_text(self, key):
+        base = {"all": "全部", "info": "信息", "req": "请求",
+                "warn": "警告", "error": "错误"}[key]
+        allow = self.LOG_FILTERS[key]
+        if allow is None:
+            n = len(self._log_buf)
+        else:
+            n = sum(1 for _t, _m, lv in self._log_buf if lv in allow)
+        # ★ 错误数是排障时最该一眼看到的，始终带出来
+        if key in ("all", "error") and n:
+            return "%s %d" % (base, n)
+        return base
+
+    def _update_log_badge(self):
+        """更新「查看日志」按钮上的错误计数；弹窗开着时顺带同步 chips。
+
+        ★ 日志藏进弹窗之后，"有没有出错"只能靠这个角标 ——
+          所以哪怕弹窗没开，也要照常更新。
+        """
+        errs = sum(1 for _t, _m, lv in self._log_buf if lv == "error")
+        if self.btn_log is not None:
+            try:
+                self.btn_log.configure(text=("查看日志 %d" % errs) if errs else "查看日志")
+            except Exception:  # noqa: BLE001
+                pass
+        for k, chip in self._log_chips.items():
+            chip.configure(text=self._chip_text(k))
+
+    def _render_log(self):
+        if self.txt is None:
+            return                 # 弹窗没开：不用渲染，缓冲照收
+        allow = self.LOG_FILTERS.get(self._log_filter)
+        kw = (self._log_kw.get() or "").strip().lower()
         self.txt.configure(state="normal")
-        self.txt.insert("end", "%s\n" % msg, level)
-        self.txt.see("end")
+        self.txt.delete("1.0", "end")
+        shown = 0
+        for ts, msg, level in self._log_buf:
+            if allow is not None and level not in allow:
+                continue
+            if kw and kw not in msg.lower():
+                continue
+            self.txt.insert("end", "%s  %s\n" % (ts, msg), level)
+            shown += 1
+        if not shown:
+            self.txt.insert("end", "（当前筛选下没有日志）\n", "meta")
         self.txt.configure(state="disabled")
+        if not self._log_paused.get():
+            self.txt.see("end")
+
+    def clear_log(self):
+        self._log_buf.clear()
+        self._log_dirty = True
+        self._flush_log()
 
     # ---- 配置
 
@@ -635,6 +1522,7 @@ class Console:
                 "在途请求会先跑完（建单不会跨库撕裂）。" % (cur or "(未知)", target, target)):
             self.log("已取消切换账套。", "meta")
             return
+        ok = True
         if alive:
             ok, msg = self.dm.request_db_switch(target, source="gui")
             self.log(msg, "ok" if ok else "error")
@@ -651,7 +1539,22 @@ class Console:
                 self.cmb_db.set(target)
             else:
                 messagebox.showerror(APP_TITLE, msg)
+        if ok:
+            self._after_db_switch(cur, target)
         self._refresh()
+
+    def _after_db_switch(self, old_db, new_db):
+        """换账套成功之后：让燕秀面板丢掉旧账的物料库。
+
+        ★ 不丢掉会发生什么：候选列表还是按 A 账的 HPKhType 给编号，人点下去写进 B 账 ——
+          那个编号在 B 账里要么不存在、要么根本是另一种东西，
+          而且界面上一切都"正常"，只有对账时才看得出来。
+        """
+        try:
+            if self.on_db_switched:
+                self.on_db_switched(old_db, new_db)
+        except Exception as exc:  # noqa: BLE001
+            self.log("通知燕秀面板重置物料库失败：%s" % exc, "warn")
 
     def open_cfg(self):
         if not self.cfg_path:
@@ -668,6 +1571,150 @@ class Console:
             os.startfile(p)  # noqa: S606
         except Exception:  # noqa: BLE001
             messagebox.showinfo(APP_TITLE, "日志路径：\n%s" % p)
+
+    # ---- 状态翻译（★ 本次重构的核心）
+    #
+    # 后台 Agent 早把结论写在 status.json 里了，这边只做"翻译"，不重新判断：
+    #   _badge_state()  → 顶栏徽章
+    #   _diag_content() → 诊断卡（正常 / 未运行时返回 None，整块不渲染）
+
+    def _badge_state(self, st, alive):
+        """返回 (level, 徽章文案)。
+
+        ★ 用 daemon 写的 state 判，**不是"进程在不在"**。
+          旧逻辑只看 read_pid()：进程活着就画绿色「后台运行中」，
+          于是"一条请求都处理不了"的机器顶栏照样是绿的 —— 界面给出了最乐观的错结论。
+        """
+        if not alive:
+            return "stop", "未运行"
+        st = st or {}
+        if st.get("stale"):
+            return "warn", "状态未更新 %ds" % int(st.get("age_sec") or 0)
+        if st.get("connected"):
+            return "ok", "已连云端"
+        state = st.get("state") or ""
+        if not state:
+            return "warn", "状态未知"
+        return STATE_LEVEL.get(state, ("warn", state))
+
+    def _diag_content(self, st, alive):
+        """提示条内容；不需要提示时返回 None（整块不出现）。
+
+        ★ 只给"结论 + 该去点哪里"，**不放按钮** —— 动作统一在操作行。
+        """
+        if not alive:
+            # 未启动也给引导（原来是"什么都不显示"，用户打开界面时反而最空）
+            return {
+                "level": "info",
+                "title": "未启动",
+                "desc": "点右侧「启动后台 Agent」即可上线；上线后这个窗口可以随时关掉。",
+                "ev": "",
+            }
+        st = st or {}
+        if st.get("stale"):
+            return {
+                "level": "warn",
+                "title": "状态超过 %d 秒没更新" % int(st.get("age_sec") or 0),
+                "desc": "正常情况每 2 秒写一次。先点「重新探测」看看；仍不动就「停止」再「启动」。",
+                "ev": "state=%s　·　age=%ss　·　connected=%s" % (
+                    st.get("state") or "?", st.get("age_sec"), st.get("connected")),
+            }
+        if st.get("connected"):
+            return None            # 正常态：整块不出现，不占高度
+        state = st.get("state") or ""
+        logs = st.get("logs") or []
+
+        # 被顶号 / 重连中：偶发一次不吵，反复出现才提示
+        if state in ("被顶号", "重连中"):
+            n = self._count_log(logs, "顶掉")
+            if n < 3:
+                return None
+            hint = self._find_log(logs, "个 Agent 进程")
+            desc = ("同一商户码只允许一条连接。点「更多 → 停止全部 Agent」清掉本安装目录的"
+                    "残留再重新启动；若本机确实只有一个实例，就去另一台机器上找。")
+            if hint:
+                desc = hint + " " + desc
+            return {
+                "level": "warn",
+                "title": "同一个商户码有两条连接在抢（已 %d 次）" % n,
+                "desc": desc,
+                "ev": "state=%s　·　日志里「顶掉」%d 次　·　最后一条 %s" % (
+                    state, n, self._last_log_time(logs)),
+            }
+
+        spec = STATE_DIAG.get(state)
+        if not spec:
+            return None            # 未知状态不猜
+        return {
+            "level": spec.get("level", "err"),
+            "title": spec["title"],
+            "desc": spec["desc"],
+            "ev": self._diag_evidence(st, state),
+        }
+
+    def _diag_evidence(self, st, state):
+        """依据行：把 daemon 写的东西原样摆出来，便于判断、也便于转述给技术员。"""
+        bits = ["state=%s" % state]
+        err = str(st.get("last_err") or "").strip()
+        if err:
+            bits.append("last_err=%s" % err[:180])
+        db = st.get("database_verified") or st.get("database") or ""
+        if db:
+            bits.append("实测账套=%s" % db)
+        return "　·　".join(bits)
+
+    def _render_diag(self, content):
+        """渲染诊断卡；content 为 None 时 pack_forget（不占高度）。
+
+        三档配色：info 浅蓝（给引导）/ warn 黄（正在自动恢复）/ err 红（要人动手）
+        """
+        if content is None:
+            if self.diag.winfo_manager():
+                self.diag.pack_forget()
+            return
+        lvl = content.get("level", "err")
+        if lvl == "warn":
+            bg, bd, fg_t, fg_d, ic_bg, fg_e, ev_bg, mark = (
+                "#fffbeb", "#fcd34d", "#92400e", "#78350f",
+                "#fef3c7", "#92400e", "#fffdf5", "!")
+        elif lvl == "info":
+            bg, bd, fg_t, fg_d, ic_bg, fg_e, ev_bg, mark = (
+                "#eff6ff", "#93c5fd", "#1e40af", "#1e3a8a",
+                "#dbeafe", "#1d4ed8", "#f8fbff", "i")
+        else:
+            bg, bd, fg_t, fg_d, ic_bg, fg_e, ev_bg, mark = (
+                "#fef2f2", "#fca5a5", "#991b1b", "#7f1d1d",
+                "#fee2e2", "#9f1239", "#fff5f5", "!")
+        self.diag.configure(bg=bg, highlightbackground=bd)
+        self.diag_inner.configure(bg=bg)
+        self.diag_ic.configure(bg=ic_bg, fg=fg_t, text=mark)
+        self.diag_title.configure(bg=bg, fg=fg_t, text=content.get("title") or "")
+        self.diag_desc.configure(bg=bg, fg=fg_d, text=content.get("desc") or "")
+        ev = content.get("ev") or ""
+        if ev:
+            self.diag_ev.configure(bg=ev_bg, fg=fg_e, text=ev)
+            if not self.diag_ev.winfo_manager():
+                self.diag_ev.pack(fill="x", pady=(5, 0), padx=(31, 0))
+        elif self.diag_ev.winfo_manager():
+            self.diag_ev.pack_forget()     # 没有依据就别留一个空框
+        if not self.diag.winfo_manager():
+            self.diag.pack(fill="x", padx=14, pady=(10, 0), before=self.strip)
+
+    @staticmethod
+    def _count_log(logs, keyword):
+        return sum(1 for it in logs if keyword in (it.get("msg") or ""))
+
+    @staticmethod
+    def _find_log(logs, keyword):
+        for it in reversed(logs):
+            m = it.get("msg") or ""
+            if keyword in m:
+                return m
+        return ""
+
+    @staticmethod
+    def _last_log_time(logs):
+        return (logs[-1].get("t") if logs else "") or "—"
 
     # ---- 定时轮询（GUI 只读，不持有任何连接）
 
@@ -689,57 +1736,51 @@ class Console:
     def _refresh(self):
         pid, alive = self.dm.read_pid()
         st = self.dm.read_status()
+        s = st or {}
 
+        # ---------- 顶栏药丸：以 daemon 的 state 为准，不再只看进程在不在 ----------
+        level, badge = self._badge_state(st, alive)
+        self._badge_level = level
+        dot = DOT_FG.get(level, "#94a3b8")
+        pill_bg, pill_fg = BADGE_BG.get(level, ("#334155", "#e2e8f0"))
+        self.badge.configure(bg=pill_bg)
+        self.lbl_dot.configure(fg=dot, bg=pill_bg)
+        self.lbl_state.configure(text=badge, fg=pill_fg, bg=pill_bg)
+        if s.get("version"):
+            self.lbl_ver.configure(text="v%s" % s["version"])
+
+        # ---------- 启停按钮可用性（★ 这套 disabled 联动是既有正确实现，别改坏）----------
+        self.btn_start.configure(state="normal" if not alive else "disabled")
+        self.btn_stop.configure(state="disabled" if not alive else "normal")
+
+        # ---------- 状态行 ----------
+        self.lbl_headline.configure(text=HEADLINE.get(level, "运行中"),
+                                    fg=HEADLINE_FG.get(level, "#0f172a"))
+        bits = []
         if alive:
-            self.lbl_state.configure(text="后台运行中", fg="#22c55e")
-            self.btn_start.configure(state="disabled")
-            self.btn_stop.configure(state="normal")
-            self.lbl_agent.configure(
-                text="后台 Agent：运行中（PID %d）" % pid, fg="#15803d")
+            bits.append("PID %d" % pid)
+            bits.append("已运行 %s" % _dur(s.get("uptime_sec")))
+            if level == "err":
+                bits.append("进程还在，但当前不提供服务")
         else:
-            self.lbl_state.configure(text="未运行", fg="#94a3b8")
-            self.btn_start.configure(state="normal")
-            self.btn_stop.configure(state="disabled")
             # 也许有进程但 pid 文件丢了，兜底扫一遍
-            # ★ 2026-09-20：这里以前每轮都无条件扫，而 agent_processes()
-            #   内部会 spawn 一个 powershell.exe 取命令行 → 黑窗闪烁的元凶。
-            #   现在 _iter_processes() 已改成纯 Win32 API（0.012s、零子进程），
-            #   扫描本身不再有副作用；但为了不给「幽灵进程」制造假象，
-            #   仍然只在**需要时**才提示，并把处置说得更明确。
+            # ★ 2026-09-20：agent_processes() 已改成纯 Win32 API（0.012s、零子进程），
+            #   不再闪黑窗；但为了不给「幽灵进程」制造假象，仍然只在需要时才提示。
             leftovers = self.dm.agent_processes(exclude_pids=(os.getpid(),))
             if leftovers:
-                self.lbl_agent.configure(
-                    text="后台 Agent：发现 %d 个残留进程但无 pid 文件 → 点『停止』清理"
-                         % len(leftovers), fg="#b45309")
-            else:
-                self.lbl_agent.configure(text="后台 Agent：未运行", fg="#64748b")
+                bits.append("发现 %d 个残留进程 → 点『停止』清理" % len(leftovers))
+        db = s.get("database_verified") or s.get("database") or ""
+        if db:
+            bits.append("账套 %s" % db)
+        if alive and s.get("recv") is not None:
+            bits.append("接收 %s · 发送 %s" % (s.get("recv"), s.get("sent")))
+        self.lbl_facts.configure(text="　·　".join(bits))
+
+        # ---------- 提示 / 诊断条（正常态整块不出现）----------
+        self._render_diag(self._diag_content(st, alive))
 
         if st:
-            conn = st.get("connected")
-            state = st.get("state") or "?"
-            stale = st.get("stale")
-            # ★ 进程已死时，"已连接"是临终残影，不能照实显示
-            if not alive:
-                self.lbl_conn.configure(
-                    text="云端：—（后台 Agent 已退出，下面是它退出前的最后记录）", fg="#b45309")
-            elif stale:
-                self.lbl_conn.configure(
-                    text="云端：状态未更新 %ds（可能卡住，可点『刷新状态』）" % st.get("age_sec", 0),
-                    fg="#b45309")
-            else:
-                self.lbl_conn.configure(
-                    text="云端：%s" % ("已连接 ✓" if conn else state),
-                    fg="#15803d" if conn else "#475569")
-            up = st.get("uptime_sec") or 0
-            self.lbl_stat.configure(
-                text="接收 %s 条 / 发送 %s 条 / 运行 %s   （Agent 版本 %s，更新于 %s）" % (
-                    st.get("recv"), st.get("sent"), _dur(up),
-                    st.get("version") or "?", st.get("updated_at") or "?"))
             self._sync_log(st.get("logs") or [])
-        else:
-            if alive:
-                self.lbl_conn.configure(text="云端：启动中…（后台进程刚起来，稍候）", fg="#b45309")
-            self.lbl_stat.configure(text="接收 — / 发送 — / 运行 —")
 
         self._update_db_line(st if alive else {}, alive)
 
@@ -783,21 +1824,110 @@ class Console:
             self.root.title(title)
 
     def _sync_log(self, logs):
-        """把后台 Agent 的日志增量贴到窗口里。"""
+        """把后台 Agent 的日志增量贴进缓冲。
+
+        ★ 契约不能破：self._last_log_count 是 daemon `logs` 列表的**长度水位**。
+          daemon 那边内存上限 300 条、写进 status.json 的只有最后 80 条
+          （agent_daemon.py L1005 / L1028），所以一旦水位超过 80 就必须靠
+          logs[-20:] 兜底 —— 这段逻辑原本就是这样，这里只是把"写控件"换成"写缓冲"。
+        """
         n = len(logs)
         if n == self._last_log_count:
             return
         fresh = logs[self._last_log_count:] if n > self._last_log_count else logs[-20:]
         self._last_log_count = n
         for item in fresh:
-            self.log("[%s] %s" % (item.get("t", ""), item.get("msg", "")),
-                     item.get("level", "info"))
+            self._append_log(item.get("t") or "", item.get("msg") or "",
+                             item.get("level", "info"))
 
     # ---- 动作
 
-    def refresh_now(self):
+    # ---- 重新探测（2026-10-12 取代原来的「刷新状态」）
+    #
+    # ★ 为什么取代：原按钮只是手动跑一次 _refresh()，而 _tick() 每 3 秒自动跑一次
+    #   —— 不 ping 云端、不查库、不重连，点了没反应，反而像坏了。
+    # ★ 现在真探三件事：云端通不通 / 账套读不读得到 / 进程在不在。
+    # ★ 两条刻意的界限：
+    #     ① 不写 status.json —— 那份文件由 daemon 每 2 秒覆盖（agent_daemon.py L1429），
+    #        GUI 写进去会被立刻盖掉，还可能和 daemon 抢文件。结果只活在界面和日志里。
+    #     ② 不重启、不重连 —— 探测只回答"现在行不行"，不改变任何状态。真要重连，
+    #        用户该点「停止」再「启动」；那是明确动作，不该被一个探测按钮偷偷做掉。
+
+    def probe_now(self):
+        if self._probe_after is not None:
+            try:
+                self.root.after_cancel(self._probe_after)
+            except Exception:  # noqa: BLE001
+                pass
+            self._probe_after = None
+
+        self.log("—" * 50, "meta")
+        self.log("开始重新探测…", "meta")
+        pid, alive = self.dm.read_pid()
+        cloud = self._probe_cloud()
+        db = self._probe_database()
+        bits = ["云端 %s" % cloud,
+                "账套 %s" % db,
+                "进程 %s" % (("PID %d ✓" % pid) if alive else "未运行")]
+        good = cloud.startswith("✓") and db.startswith("✓")
+        self.log("重新探测：" + "　".join(bits), "ok" if good else "warn")
+        if not good:
+            self.log("（探测只回答『现在行不行』，不会自动重连；"
+                     "要重连请点「停止」再「启动」）", "meta")
+        self.lbl_facts.configure(text="重新探测：　" + "　·　".join(bits))
+        self._probe_after = self.root.after(8000, self._probe_revert)
+
+    def _probe_revert(self):
+        """8 秒后把状态行还回常规事实串。"""
+        self._probe_after = None
         self._refresh()
-        self.log("已刷新。", "meta")
+
+    def _probe_cloud(self):
+        """探云端：GET /api/v1/health（把 relay_url 的 ws:// 换成 http://）。
+
+        只读、超时 3 秒。返回值以 ✓ / ✗ 开头，调用方据此判断。
+        """
+        import urllib.request
+        st = self.dm.read_status() or {}
+        url = str(st.get("relay_url") or "").strip() or str(
+            ((self.cfg or {}).get("agent") or {}).get("relay_url") or "")
+        if not url:
+            return "地址未知"
+        base = url.replace("wss://", "https://").replace("ws://", "http://")
+        api = base.split("/ws/")[0].rstrip("/") + "/api/v1/health"
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(api, timeout=3) as resp:
+                resp.read(4096)
+            return "✓ %dms" % int((time.time() - t0) * 1000)
+        except Exception as exc:  # noqa: BLE001
+            return "✗ %s" % type(exc).__name__
+
+    def _probe_database(self):
+        """探账套：用配置里的凭据连一次，跑 SELECT DB_NAME() 看实测是哪一本。
+
+        ★ 为什么要主动连：界面平时显示的是 daemon 上报的 database_verified，
+          那是**被动**的（等它下次 flush）；这里主动连一次，立刻知道。
+        ★ 只读、短连接 —— session() 用完会把连接还回池。
+        """
+        if not self.cfg:
+            return "配置未就绪"
+        try:
+            ensure_import_path()
+            from v3agent import sql as v3sql
+        except Exception as exc:  # noqa: BLE001
+            return "✗ 加载失败（%s）" % type(exc).__name__
+        try:
+            with v3sql.session(self.cfg) as conn:
+                name = v3sql.current_database(conn.cursor())
+        except KeyError as exc:      # 配置缺字段（正规装机不会，开发态会）
+            return "✗ 配置不完整（缺 %s）" % exc
+        except Exception as exc:  # noqa: BLE001
+            return "✗ %s" % type(exc).__name__
+        want = str(((self.cfg or {}).get("sql") or {}).get("database") or "")
+        if name and want and name != want:
+            return "✗ 实测 %s（配置写的是 %s）" % (name, want)
+        return "✓ %s" % (name or "未知")
 
     def _scope(self):
         """本窗口这一份安装的地盘 = config.json 所在目录。
@@ -909,11 +2039,45 @@ class Console:
         self._last_log_count = 0
         self._refresh()
 
+    def stop_all(self):
+        """停止**本安装目录**下的全部 Agent 实例（诊断卡上「停止全部 Agent」用）。
+
+        ★ 这不是"清理垃圾"：dm.kick_duplicates() 的 keep_pid 默认 None，
+          会把本安装目录下**每一个** Agent 进程都杀掉 —— 包括正在服务的那一个。
+          所以必须二次确认，并把"停完之后要点启动"说清楚。
+          （scope 限定在本安装目录，同机别家的 Agent 不会被碰。）
+        """
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "将停止本安装目录下的**全部** Agent 进程，\n"
+                "包括正在运行的那一个。\n\n"
+                "适用场景：同一个商户码有多个实例在互相顶号。\n"
+                "停完之后需要点『启动后台 Agent』重新接通。\n\n"
+                "确定继续？"):
+            self.log("已取消「停止全部 Agent」。", "meta")
+            return
+        scope = self._scope()
+        killed = self.dm.kick_duplicates(exclude_pids=(os.getpid(),), scope=scope)
+        if killed:
+            self.log("已停止本安装目录下的 %d 个 Agent：" % len(killed), "warn")
+            for p, desc in killed:
+                self.log("    PID %-7d %s" % (p, desc), "warn")
+            self.log("★ 现在点『启动后台 Agent』重新接通。", "ok")
+        else:
+            self.log("本安装目录没有找到正在运行的 Agent 进程。", "meta")
+        others = self.dm.other_installs(scope)
+        if others:
+            self.log("本机另有 %d 个**不同目录**的 Agent 仍在运行（不是本窗口的，故意没停）"
+                     % len(others), "meta")
+        self._last_log_count = 0
+        self._refresh()
+
     def on_close(self):
         """★ 关键：关窗口**不停** Agent。"""
         pid, alive = self.dm.read_pid()
         if alive:
             self.log("窗口关闭。后台 Agent（PID %d）继续运行。" % pid, "meta")
+        self._save_geometry()      # 记住用户拉出来的窗口尺寸/位置
         try:
             self.root.destroy()
         except Exception:  # noqa: BLE001
@@ -927,6 +2091,26 @@ def _dur(sec):
     if sec < 3600:
         return "%d 分 %d 秒" % (sec // 60, sec % 60)
     return "%d 时 %d 分" % (sec // 3600, (sec % 3600) // 60)
+
+
+def _ts(v):
+    """云端给的是 unix 秒，转成本地时间的「月-日 时:分」。"""
+    try:
+        return time.strftime("%m-%d %H:%M", time.localtime(float(v)))
+    except Exception:  # noqa: BLE001
+        return "—"
+
+
+def _idle(sec):
+    """「多久没动静了」—— 会话表里 last_seen 与现在的差。"""
+    sec = int(sec or 0)
+    if sec < 60:
+        return "%d 秒前" % sec
+    if sec < 3600:
+        return "%d 分钟前" % (sec // 60)
+    if sec < 86400:
+        return "%d 小时前" % (sec // 3600)
+    return "%d 天前" % (sec // 86400)
 
 
 # ------------------------------------------------------------------ 燕秀标签页
@@ -1008,6 +2192,10 @@ def startup_files(argv):
 
 
 def main():
+    # ★ DPI 必须在建根窗口**之前**声明，否则高分屏上整窗发虚。
+    #   放在 main() 最前面：daemon 模式本来就没有窗口，声明它对进程无害。
+    _init_dpi()
+
     # --__daemon 走纯后台，绝不建窗口
     if "--__daemon" in sys.argv:
         ensure_import_path()
@@ -1072,14 +2260,26 @@ def main():
             yx_box["panel"] = panel
         return yx_box["panel"]
 
+    def _on_db_switched(old_db, new_db):
+        """换账套 → 燕秀面板丢掉旧账的物料库（面板还没建过就不用管，建起来自然是新账）。"""
+        panel = yx_box["panel"]
+        if panel is None:
+            return
+        stale = panel.forget_library(old_db, new_db)
+        console.log("燕秀页物料库已清空（%s → %s）%s"
+                    % (old_db or "?", new_db,
+                      "；之前匹配的 %d 行需要重新匹配" % stale if stale else ""), "warn")
+
+    console.on_db_switched = _on_db_switched
+
     def _fit_window():
-        """燕秀页列比控制台多：窗口不够大时放大一次（只放大，不缩回去）。"""
-        try:
-            w, h = root.winfo_width(), root.winfo_height()
-            if w < 1150 or h < 660:
-                root.geometry("%dx%d" % (max(w, 1150), max(h, 660)))
-        except Exception:  # noqa: BLE001
-            pass
+        """**不再改窗口尺寸**（2026-10-13）。
+
+        原来第一次切到燕秀页时会把窗口撑到 ≥1150x660 —— 这就是"每切一次页大小都在变"
+        的那一下。现在初始尺寸按两页真正需求一次算够（WIN_W/WIN_H，probe-gui-fit.py 量的），
+        切页只切内容。函数留着是为了看清这段历史，别再往回加 geometry。
+        """
+        return
 
     files = startup_files(sys.argv)
     if files:

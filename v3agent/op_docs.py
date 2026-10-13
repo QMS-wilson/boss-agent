@@ -362,7 +362,11 @@ DOCS = {
     "yxparts.suggest": {
         "cat": "燕秀零件处理", "label": "匹配候选（相似度）",
         "desc": "给未匹配行推荐候选物料，与桌面双击弹窗同一函数同一排序",
-        "example": {"name": "杯头螺丝", "spec": "M6x35", "actual": "", "keyword": ""}},
+        "note": "默认只回相似度≥0.35 的候选。带 `search:1` + `keyword` 时改成**在整库里搜**："
+                "命中就回、不再套相似度门槛（编号 / 客户品名 / 系统品名 / 规格都算命中），"
+                "最多 50 条，相似度只用来排序。空关键词回 YX_SEARCH_NO_KEYWORD。",
+        "example": {"name": "杯头螺丝", "spec": "M6x35", "actual": "", "keyword": ""},
+        "example2": {"name": "杯头螺丝", "spec": "M6x35", "search": 1, "keyword": "6204"}},
     "yxparts.remember": {
         "cat": "燕秀零件处理", "label": "记住人工确认",
         "desc": "把人工确认的「客户写法 → hpbh」写进本地记忆库，下次同写法自动命中",

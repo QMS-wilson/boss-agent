@@ -18,7 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from .config import load_config, save_config
-from .core import Matcher, PartRow, norm_text, parse_file
+from .core import Matcher, PartRow, norm_text, parse_file, search_norm
 from .core import parse_import_rows
 from .exporter import export_excel
 from .sqlsource import (
@@ -110,6 +110,8 @@ class YxPartsPanel(ttk.Frame):
         self.storage = Storage(db_path)
         self.matcher = Matcher(self.storage)
         self.rows: list[PartRow] = []
+        # 换过账套之后，之前匹配出来的编号属于旧账 —— 状态栏要说破，别让人以为还能用
+        self.stale_rows = 0
 
         self._build_toolbar()
         self._build_table()
@@ -130,10 +132,15 @@ class YxPartsPanel(ttk.Frame):
 
     # ---------------- 界面搭建 ----------------
     def _setup_style(self):
-        """行高按微软雅黑字号调大，避免文字被裁掉。"""
+        """行高按微软雅黑字号调大，避免文字被裁掉。
+
+        ★ 数字不再自己写（原来是 30）：Style 全进程共享，控制台那边按字体算出 43，
+          这里写 30 就会把两张表一起压回切字的状态。两边共用 v3agent/ui_metrics。
+        """
+        from v3agent.ui_metrics import tree_rowheight
         style = ttk.Style(self)
         try:
-            style.configure("Treeview", rowheight=30)
+            style.configure("Treeview", rowheight=tree_rowheight(self))
             style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10), padding=(4, 4))
             style.configure("TButton", padding=(6, 3))
             style.configure("TEntry", padding=(3, 3))
@@ -141,21 +148,35 @@ class YxPartsPanel(ttk.Frame):
             pass
 
     def _build_toolbar(self):
-        bar = ttk.Frame(self, padding=(8, 6))
-        bar.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(bar, text="打开客户文件", command=self.open_files).pack(side=tk.LEFT)
-        ttk.Button(bar, text="自动匹配全部", command=self.auto_match_all).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        ttk.Button(bar, text="连接SQL Server物料库", command=self.connect_sql).pack(side=tk.LEFT)
-        ttk.Button(bar, text="连接设置", command=self.open_settings).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(bar, text="物料库预览", command=self.open_item_preview).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(bar, text="导入燕秀品名", command=self.open_import_dialog).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        ttk.Button(bar, text="导入Excel物料档案(备用)", command=self.import_erp).pack(side=tk.LEFT)
-        ttk.Button(bar, text="导出导入文件", command=self.export).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(bar, text="匹配记忆库", command=self.open_memory).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(bar, text="清空列表", command=self.clear_rows).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(bar, text="使用说明", command=self.show_help).pack(side=tk.RIGHT)
+        """工具行 —— **折两行，一颗都不藏**（2026-10-13）。
+
+        ★ 为什么不收进「更多」：单行 11 颗要 2436px，窗口只有 1704，
+          最省事的做法是把低频的收进菜单 —— 但用户明确否掉了：
+          "不要隐藏起来，要保持和原来一致"。原来 11 颗都在明面，
+          藏进菜单等于让功能看起来变少了，出问题时还得先猜菜单里有没有。
+        ★ 折行点就用源码**原有的那条分组分隔线**（物料库一组、导入导出一组），
+          顺序、按钮、分组线都不动：第一行 1335px、第二行 1145px，1704 放得下。
+        """
+        groups = (
+            [("打开客户文件", self.open_files), ("自动匹配全部", self.auto_match_all)],
+            [("连接SQL Server物料库", self.connect_sql), ("连接设置", self.open_settings),
+             ("物料库预览", self.open_item_preview), ("导入燕秀品名", self.open_import_dialog)],
+            [("导入Excel物料档案(备用)", self.import_erp), ("导出导入文件", self.export),
+             ("匹配记忆库", self.open_memory), ("清空列表", self.clear_rows)],
+        )
+        row1 = ttk.Frame(self, padding=(8, 6))
+        row2 = ttk.Frame(self, padding=(8, 0, 8, 6))
+        row1.pack(side=tk.TOP, fill=tk.X)
+        row2.pack(side=tk.TOP, fill=tk.X)
+        for gi, group in enumerate(groups):
+            target = row1 if gi < 2 else row2
+            if gi == 1:
+                ttk.Separator(row1, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+            for bi, (text, cmd) in enumerate(group):
+                ttk.Button(target, text=text, command=cmd).pack(
+                    side=tk.LEFT, padx=(0, 0) if bi == 0 else (6, 0))
+        # 说明仍然贴右，但挪到第二行末尾 —— 第一行已经排到 1335px，挤不下了
+        ttk.Button(row2, text="使用说明", command=self.show_help).pack(side=tk.RIGHT)
 
     def _build_table(self):
         wrap = ttk.Frame(self, padding=(8, 0, 8, 4))
@@ -270,6 +291,7 @@ class YxPartsPanel(ttk.Frame):
             return
         sys_map, missing_sys = fetch_hpdan_sys_map(self.config)
         self.matcher.load_hpdan(rows, sys_map)
+        self.stale_rows = 0          # ★ 已经按这本账重算过，旧账的警告不能再挂着
         if self.rows:
             for row in self.rows:
                 self.matcher.auto_match(row)
@@ -303,6 +325,7 @@ class YxPartsPanel(ttk.Frame):
             messagebox.showerror("导入失败", str(exc))
             return
         self.matcher.load_from_storage()
+        self.stale_rows = 0
         if self.rows:
             for row in self.rows:
                 self.matcher.auto_match(row)
@@ -388,12 +411,28 @@ class YxPartsPanel(ttk.Frame):
                 tags=tags,
             )
 
+    def forget_library(self, old_db: str, new_db: str) -> int:
+        """换账套之后：物料库必须整份丢掉。返回受影响（之前已匹配）的行数。
+
+        ★ 已匹配的行**不清空值**，只标灰并计数 —— 那些编号是人在旧账上一个个确认出来的，
+          悄悄抹掉比留着更气人；但状态栏要把它说破，否则他会以为"还能继续用"。
+        """
+        self.matcher.forget(f"已换账套（{old_db or '旧账'} → {new_db}），需重新连接")
+        stale = sum(1 for r in self.rows if r.erp_code)
+        if stale:
+            self.stale_rows = stale
+        self._refresh_status()
+        return stale
+
     def _refresh_status(self):
         total = len(self.rows)
         matched = sum(1 for r in self.rows if r.erp_code)
+        stale = getattr(self, "stale_rows", 0)
+        note = (f" ｜ ★ 其中 {stale} 行是按旧账套的物料库给的编号，需重新匹配"
+                if stale and matched else "")
         self.status_var.set(
             f"共 {total} 行 ｜ 已匹配 {matched} 行 ｜ 未匹配 {total - matched} 行 ｜ "
-            f"物料库：{self.matcher.source_label} ｜ 匹配记忆 {len(self.storage.all_memory())} 条"
+            f"物料库：{self.matcher.source_label}{note} ｜ 匹配记忆 {len(self.storage.all_memory())} 条"
         )
 
     def _update_row(self, index: int):
@@ -694,6 +733,12 @@ class MatchDialog(tk.Toplevel):
 
         self._candidates = []
         self._load_candidates()
+        if not getattr(self.matcher, "items", None):
+            # ★ 库里一条都没有时不能只给一片空白：那和"搜不到"长得一模一样，
+            #   人会以为是自己关键词写错了（现场就是这么绕了半天）。
+            self.cand.insert("", tk.END, values=(
+                "—", f"物料库还没加载（{self.matcher.source_label}）",
+                "点工具行的『连接SQL Server物料库』重新连一次再回来选", "", "", "", ""))
 
     def _load_candidates(self):
         self._candidates = self.matcher.suggest(self.row)
@@ -701,20 +746,13 @@ class MatchDialog(tk.Toplevel):
 
     def _apply_filter(self):
         self.cand.delete(*self.cand.get_children())
-        kw = norm_text(self.search_var.get())
+        # ★ 筛选走 core 那一份 `_blob` + `search_norm`：桌面与手机必须搜到同一批货。
+        #   原来这里自己拼了一遍（少了拼音码），同一段字两端结果不一样。
+        kw = search_norm(self.search_var.get())
         shown = 0
         for score, it in self._candidates:
-            if kw:
-                sys_name = self._sys_name(it)
-                blob = (
-                    (it.get("name_n") or "")
-                    + (it.get("spec_a_n") or "")
-                    + (it.get("spec_b_n") or "")
-                    + (it.get("code") or "")
-                    + norm_text(sys_name)
-                )
-                if kw not in blob:
-                    continue
+            if kw and kw not in self.matcher._blob(it):
+                continue
             self.cand.insert(
                 "",
                 tk.END,
